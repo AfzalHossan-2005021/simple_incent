@@ -150,7 +150,7 @@ def pairwise_align(
 
     # Calculate gene expression dissimilarity
     # filePath = '/content/drive/MyDrive/Thesis_data_anup/local_data'
-    cosine_dist_gene_expr = cosine_distance(sliceA, sliceB, sliceA_name, sliceB_name, filePath, use_rep = use_rep, use_gpu = use_gpu, nx = nx, beta = beta, overwrite=overwrite)
+    cosine_dist_gene_expr = cosine_distance(sliceA, sliceB, sliceA_name, sliceB_name, filePath, use_rep = use_rep, use_gpu = use_gpu, nx = nx, overwrite=overwrite)
 
     # ── Explicit cell-type mismatch penalty ──────────────────────────────
     # Binary matrix: 0 for same type, 1 for different type.
@@ -567,41 +567,72 @@ def neighborhood_distribution(curr_slice, radius):
     return np.array(cells_within_radius)
 
 
-def cosine_distance(sliceA, sliceB, sliceA_name, sliceB_name, filePath, use_rep = None, use_gpu = False, nx = ot.backend.NumpyBackend(), beta = 0.8, overwrite = False):
-    from sklearn.metrics.pairwise import cosine_distances
+
+def cosine_distance(
+    sliceA,
+    sliceB,
+    sliceA_name,
+    sliceB_name,
+    filePath,
+    use_rep=None,
+    use_gpu=False,
+    nx=ot.backend.NumpyBackend(),
+    overwrite=False,
+):
+    """
+    Compute cosine distance between gene expression matrices of two slices.
+
+    Backend-safe (NumPy / Torch), GPU-safe, and cache-enabled.
+    """
+
     import os
-    import pandas as pd
+    import numpy as np
+    from sklearn.metrics.pairwise import cosine_distances
 
-    A_X, B_X = nx.from_numpy(to_dense_array(extract_data_matrix(sliceA,use_rep))), nx.from_numpy(to_dense_array(extract_data_matrix(sliceB,use_rep)))
+    # ─────────────────────────────────────────────
+    # Extract expression matrices
+    # ─────────────────────────────────────────────
+    A_X = extract_data_matrix(sliceA, use_rep)
+    B_X = extract_data_matrix(sliceB, use_rep)
 
-    if isinstance(nx,ot.backend.TorchBackend) and use_gpu:
+    A_X = nx.from_numpy(to_dense_array(A_X))
+    B_X = nx.from_numpy(to_dense_array(B_X))
+
+    # Move to GPU if TorchBackend and requested
+    if isinstance(nx, ot.backend.TorchBackend) and use_gpu:
         A_X = A_X.cuda()
         B_X = B_X.cuda()
 
-   
+    # Small stability constant
     s_A = A_X + 0.01
     s_B = B_X + 0.01
 
+    # ─────────────────────────────────────────────
+    # File cache
+    # ─────────────────────────────────────────────
+    os.makedirs(filePath, exist_ok=True)
     fileName = f"{filePath}/cosine_dist_gene_expr_{sliceA_name}_{sliceB_name}.npy"
-    
+
     if os.path.exists(fileName) and not overwrite:
-        print("Loading precomputed Cosine distance of gene expression for slice A and slice B")
-        cosine_dist_gene_expr = np.load(fileName)
-    else:
-        print("Calculating cosine dist of gene expression for slice A and slice B")
+        print("Loading precomputed cosine distance (gene expression)")
+        return np.load(fileName)
 
-        # calculate cosine distance manually
-        # cosine_dist_gene_expr = 1 - (s_A @ s_B.T) / s_A.norm(dim=1)[:, None] / s_B.norm(dim=1)[None, :]
-        # cosine_dist_gene_expr = cosine_dist_gene_expr.cpu().detach().numpy()
+    print("Computing cosine distance (gene expression)")
 
-        # use sklearn's cosine_distances
-        if torch.cuda.is_available():
-            s_A = s_A.cpu().detach().numpy()
-            s_B = s_B.cpu().detach().numpy()
-        cosine_dist_gene_expr = cosine_distances(s_A, s_B)
+    # ─────────────────────────────────────────────
+    # Convert safely to NumPy (backend aware)
+    # ─────────────────────────────────────────────
+    s_A_np = nx.to_numpy(s_A)
+    s_B_np = nx.to_numpy(s_B)
 
-        print("Saving cosine dist of gene expression for slice A and slice B")
-        np.save(fileName, cosine_dist_gene_expr)
+    # ─────────────────────────────────────────────
+    # Compute cosine distance
+    # ─────────────────────────────────────────────
+    cosine_dist_gene_expr = cosine_distances(s_A_np, s_B_np)
+
+    # Save
+    np.save(fileName, cosine_dist_gene_expr)
+    print("Saved cosine distance matrix")
 
     return cosine_dist_gene_expr
 
