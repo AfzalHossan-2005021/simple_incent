@@ -14,7 +14,91 @@ from sklearn.metrics.pairwise import euclidean_distances
 from .utils import fused_gromov_wasserstein_incent, to_dense_array, extract_data_matrix, jensenshannon_divergence_backend, pairwise_msd
 
 
-# ── Hemisphere pre-selection helper ──────────────────────────────────────────
+# ── Overlap-fraction estimation helper ─────────────────────────────────────
+def _estimate_overlap_fraction(
+    M_lin: np.ndarray,
+    ns: int,
+    nt: int,
+    logFile=None,
+) -> float:
+    """
+    Estimate the spatial overlap fraction m ∈ (0, 1] between two sections
+    WITHOUT requiring any prior knowledge of the acquisition geometry.
+
+    Biological rationale
+    --------------------
+    Cells that lie in the overlapping region have at least one geometrically
+    and molecularly compatible partner in the other section, so the cost of
+    their best possible match (min row/column in the linear cost matrix) is
+    low.  Cells in the NON-overlapping region have NO compatible partner; all
+    their pairwise costs are high, so their best-match cost is also high.
+
+    This creates a bimodal distribution of per-cell best-match costs:
+        • Low mode  → overlapping cells
+        • High mode → non-overlapping cells
+
+    A 1-D Gaussian Mixture Model (k=2) separates the two populations.
+    The weight of the low-cost component is the estimated overlap fraction
+    for that side.  The final m is the minimum across both sides (the
+    bottleneck is the side with less overlap).
+
+    Parameters
+    ----------
+    M_lin : (ns, nt) ndarray
+        Combined normalised linear cost matrix (M1 + M2 contributions).
+    ns, nt : int
+        Number of source and target cells.
+    logFile : file-like, optional
+        If provided, log messages are written here.
+
+    Returns
+    -------
+    float  in (0.05, 1.0]
+    """
+    from sklearn.mixture import GaussianMixture
+
+    def _gmm_overlap_1d(costs: np.ndarray) -> float:
+        """Fraction of cells in the low-cost (overlapping) GMM component."""
+        c = costs.reshape(-1, 1).astype(np.float64)
+        c_min, c_max = c.min(), c.max()
+        if c_max - c_min < 1e-10:
+            return 1.0  # all equal → perfectly overlapping
+        c_norm = (c - c_min) / (c_max - c_min)  # scale to [0,1] for stability
+        try:
+            gm = GaussianMixture(
+                n_components=2,
+                covariance_type='full',
+                n_init=15,
+                random_state=0,
+            ).fit(c_norm)
+            low_idx = int(np.argmin(gm.means_.flatten()))
+            return float(gm.weights_[low_idx])
+        except Exception:
+            # Robust fallback: fraction below the median
+            return float((c_norm < 0.5).mean())
+
+    best_src = M_lin.min(axis=1)   # (ns,) — best cost for each source cell
+    best_tgt = M_lin.min(axis=0)   # (nt,) — best cost for each target cell
+
+    m_src = _gmm_overlap_1d(best_src)
+    m_tgt = _gmm_overlap_1d(best_tgt)
+
+    # Conservative: overlap is bounded by the side with fewer matching cells
+    m = float(np.clip(min(m_src, m_tgt), 0.05, 1.0))
+
+    msg = (
+        f"[overlap_estimate] GMM fractions — src={m_src:.3f}, tgt={m_tgt:.3f} "
+        f"→ m={m:.3f} "
+        f"(src non-overlap: {(1-m_src)*100:.1f}%, tgt non-overlap: {(1-m_tgt)*100:.1f}%)"
+    )
+    print(msg)
+    if logFile is not None:
+        logFile.write(msg + "\n")
+
+    return m
+
+
+# ── Hemisphere pre-selection helper ───────────────────────────────────────────
 def _icp_hemisphere_select(
     sliceA: AnnData,
     sliceB: AnnData,
@@ -126,9 +210,11 @@ def pairwise_align(
     sliceB_name: Optional[str] = None,
     overwrite = False,
     neighborhood_dissimilarity: str='jsd',
-    dummy_cell: bool = True,
+    dummy_cell: bool = False,
     select_hemisphere: bool = False,
     allow_reflection: bool = False,
+    overlap_fraction: Optional[float] = None,
+    auto_overlap: bool = True,
     **kwargs) -> Union[NDArray[np.floating], Tuple[NDArray[np.floating], float, float, float, float]]:
     """
 
@@ -164,6 +250,19 @@ def pairwise_align(
         allow_reflection: Used only when ``select_hemisphere=True``.  If ``True``,
             also tries the x-reflected source as a candidate (handles acquisitions
             where the source section was scanned in the opposite orientation).
+        overlap_fraction: Fraction of mass to transport, 0 < m ≤ 1.  Controls the
+            Partial FGW formulation (Chapel et al., NeurIPS 2020).  Setting m < 1
+            means (1-m) of the cells on each side are allowed to remain unmatched
+            (sent to a dummy node).  This handles ALL partial-overlap scenarios:
+            both-full, both-half, half+full, arbitrary unknown overlap.  When set
+            to 1.0 the problem reduces to fully-balanced FGW.  When ``None``
+            (default), the choice falls back to the legacy ``dummy_cell`` budget
+            approach unless ``auto_overlap=True``.
+        auto_overlap: If ``True`` and ``overlap_fraction`` is ``None``, automatically
+            estimate the overlap fraction from the linear cost matrix before running
+            FGW.  Uses a 1-D Gaussian Mixture Model on per-cell best-match costs
+            (see ``_estimate_overlap_fraction``).  Recommended for all real
+            experiments.  Overrides ``dummy_cell`` if the estimate is < 1.0.
    
     Returns:
         - Alignment of spots.
@@ -384,69 +483,161 @@ def pairwise_align(
             f"got {neighborhood_dissimilarity!r}."
         )
 
-    # ── Dummy cell augmentation ────────────────────────────────────────────
-    # Only add a dummy on the side that actually has a deficit.
-    # _has_dummy_src: True if source has fewer cells → need dummy source (birth)
-    # _has_dummy_tgt: True if target has fewer cells → need dummy target (death)
-    _has_dummy_src = False
-    _has_dummy_tgt = False
-    _budget = 0
-    _w_dummy_src = 0
-    _w_dummy_tgt = 0
+    # ── Partial FGW / Dummy-cell augmentation ─────────────────────────────
+    #
+    # TWO paths — controlled by ``overlap_fraction`` / ``auto_overlap``:
+    #
+    #  PATH A — Partial Fused Gromov-Wasserstein  (Chapel et al., NeurIPS 2020)
+    #  ─────────────────────────────────────────────────────────────────────────
+    #  Handles ALL partial-overlap scenarios without any prior knowledge of the
+    #  acquisition geometry (both-full, both-half, half+full, arbitrary).
+    #
+    #  The overlap fraction  m ∈ (0,1]  controls how much mass is transported:
+    #    • Real weights: m/ns  for source,  m/nt  for target  (sum to m each)
+    #    • Dummy weight: 1-m   for both sides (absorbs unmatched mass)
+    #    • Dummy LINEAR cost:  τ = max_cost / 2   (proven optimal by Chapel et al.)
+    #    • Dummy SPATIAL cost: 0  (keeps dummy invisible to the GW term)
+    #
+    #  Activated when  ``overlap_fraction`` is set explicitly OR when
+    #  ``auto_overlap=True`` (then m is estimated from the linear cost matrix
+    #  via a 1-D Gaussian Mixture Model on per-cell best-match costs).
+    #
+    #  PATH B — Legacy budget-based dummy cell  (backward-compatible default)
+    #  ─────────────────────────────────────────────────────────────────────────
+    #  Only handles SIZE IMBALANCE (per cell-type count deltas).  Used when
+    #  ``overlap_fraction is None`` and ``auto_overlap=False`` and
+    #  ``dummy_cell=True``.
 
-    if dummy_cell:
+    def _to_np(x):
+        """Convert any backend tensor to float64 numpy."""
+        try:
+            return x.cpu().detach().numpy().astype(np.float64)
+        except Exception:
+            return np.array(x, dtype=np.float64)
+
+    ns = sliceA.shape[0]
+    nt = sliceB.shape[0]
+
+    # State flags — set by whichever path runs below.
+    _has_dummy_src = False   # legacy path only
+    _has_dummy_tgt = False   # legacy path only
+    _budget        = 0       # legacy path only
+    _w_dummy_src   = 0       # legacy path only
+    _w_dummy_tgt   = 0       # legacy path only
+    _has_partial   = False   # True when partial FGW path is active
+    _partial_m     = 1.0
+    _ns_aug        = ns      # augmented sizes (updated below)
+    _nt_aug        = nt
+
+    # ── Resolve effective overlap fraction ────────────────────────────────
+    _eff_overlap = overlap_fraction  # may be None
+    if _eff_overlap is None and auto_overlap:
+        M1_np_est = _to_np(M1)
+        M2_np_est = _to_np(M2)
+        M_lin_est = alpha * M1_np_est + gamma * M2_np_est
+        # Normalise to [0,1] so GMM is scale-independent
+        _lin_max = M_lin_est.max()
+        if _lin_max > 1e-12:
+            M_lin_est = M_lin_est / _lin_max
+        _eff_overlap = _estimate_overlap_fraction(
+            M_lin_est[:ns, :nt], ns, nt, logFile=logFile
+        )
+        logFile.write(f"[auto_overlap] estimated overlap_fraction m={_eff_overlap:.4f}\n")
+
+    # ── PATH A: Partial FGW ───────────────────────────────────────────────
+    if _eff_overlap is not None and float(_eff_overlap) < 1.0:
+        _has_partial = True
+        _partial_m   = float(np.clip(_eff_overlap, 0.05, 1.0))
+        m            = _partial_m
+        _ns_aug      = ns + 1
+        _nt_aug      = nt + 1
+
+        logFile.write(f"[partial_fgw] overlap_fraction m={m:.4f}\n")
+        print(f"[partial_fgw] Partial FGW  m={m:.4f}  "
+              f"(unmatched: src {(1-m)*100:.1f}%,  tgt {(1-m)*100:.1f}%)")
+
+        M1_np = _to_np(M1)
+        M2_np = _to_np(M2)
+
+        # Theoretically optimal threshold: τ = max_cost / 2  (Chapel et al. 2020)
+        # Applied independently to M1 and M2 so each contributes proportionally.
+        tau_M1 = float(M1_np.max()) / 2.0
+        tau_M2 = float(M2_np.max()) / 2.0
+        logFile.write(f"[partial_fgw] τ_M1={tau_M1:.4f}, τ_M2={tau_M2:.4f}\n")
+
+        # ── Augment M1 (all dummy entries = τ_M1; dummy-to-dummy = 0) ──
+        M1_aug = np.full((_ns_aug, _nt_aug), tau_M1, dtype=np.float64)
+        M1_aug[:ns, :nt] = M1_np
+        M1_aug[ns,  nt]  = 0.0   # dummy-to-dummy is free
+        M1 = nx.from_numpy(M1_aug)
+
+        # ── Augment M2 ──
+        M2_aug = np.full((_ns_aug, _nt_aug), tau_M2, dtype=np.float64)
+        M2_aug[:ns, :nt] = M2_np
+        M2_aug[ns,  nt]  = 0.0
+        M2 = nx.from_numpy(M2_aug)
+
+        # ── Augment D_A: dummy row/col = 0 (invisible to GW term) ──
+        D_A_np  = _to_np(D_A)
+        D_A_aug = np.zeros((_ns_aug, _ns_aug), dtype=np.float64)
+        D_A_aug[:ns, :ns] = D_A_np
+        D_A = nx.from_numpy(D_A_aug)
+        if isinstance(nx, ot.backend.TorchBackend):
+            D_A = D_A.float()
+
+        # ── Augment D_B ──
+        D_B_np  = _to_np(D_B)
+        D_B_aug = np.zeros((_nt_aug, _nt_aug), dtype=np.float64)
+        D_B_aug[:nt, :nt] = D_B_np
+        D_B = nx.from_numpy(D_B_aug)
+        if isinstance(nx, ot.backend.TorchBackend):
+            D_B = D_B.float()
+
+        logFile.write(
+            f"[partial_fgw] Augmented: D_A {D_A_aug.shape}, D_B {D_B_aug.shape}, "
+            f"M1 {M1_aug.shape}, M2 {M2_aug.shape}\n"
+        )
+
+    # ── PATH B: Legacy budget-based dummy cell ────────────────────────────
+    elif dummy_cell:
         from collections import Counter
-        ns, nt = sliceA.shape[0], sliceB.shape[0]
         labels_A = sliceA.obs['cell_type_annot'].values
         labels_B = sliceB.obs['cell_type_annot'].values
         counts_A = Counter(labels_A)
         counts_B = Counter(labels_B)
         all_types = set(counts_A.keys()) | set(counts_B.keys())
-        _budget = sum(max(counts_A.get(k, 0), counts_B.get(k, 0)) for k in all_types)
+        _budget      = sum(max(counts_A.get(k, 0), counts_B.get(k, 0)) for k in all_types)
         _w_dummy_src = _budget - ns   # extra weight for dummy source cell (birth)
         _w_dummy_tgt = _budget - nt   # extra weight for dummy target cell (death)
         _has_dummy_src = _w_dummy_src > 0
         _has_dummy_tgt = _w_dummy_tgt > 0
+        _ns_aug = ns + (1 if _has_dummy_src else 0)
+        _nt_aug = nt + (1 if _has_dummy_tgt else 0)
 
         logFile.write(f"[dummy_cell] budget={_budget}, w_dummy_src={_w_dummy_src}, w_dummy_tgt={_w_dummy_tgt}\n")
         print(f"[dummy_cell] budget={_budget}, "
               f"dummy_src={'YES (birth)' if _has_dummy_src else 'NO'} w={_w_dummy_src}, "
               f"dummy_tgt={'YES (death)' if _has_dummy_tgt else 'NO'} w={_w_dummy_tgt}")
 
-        def _to_np(x):
-            """Convert backend tensor to float64 numpy."""
-            try:
-                return x.cpu().detach().numpy().astype(np.float64)
-            except Exception:
-                return np.array(x, dtype=np.float64)
-
-        _ns_aug = ns + (1 if _has_dummy_src else 0)
-        _nt_aug = nt + (1 if _has_dummy_tgt else 0)
-
         # ---- Augment D_A if dummy source needed ----
-        # Dummy spatial distance = 0: makes dummy INVISIBLE to the Gromov term.
-        # Since C1[dummy, k] = 0 for all k, the gradient df(G) for real cells
-        # is identical to the non-dummy case → spatial alignment preserved.
         if _has_dummy_src:
-            D_A_np = _to_np(D_A)
+            D_A_np  = _to_np(D_A)
             D_A_aug = np.zeros((_ns_aug, _ns_aug), dtype=np.float64)
             D_A_aug[:ns, :ns] = D_A_np
-            # D_A_aug[ns, :] and D_A_aug[:, ns] stay 0
             D_A = nx.from_numpy(D_A_aug)
             if isinstance(nx, ot.backend.TorchBackend):
                 D_A = D_A.float()
 
         # ---- Augment D_B if dummy target needed ----
         if _has_dummy_tgt:
-            D_B_np = _to_np(D_B)
+            D_B_np  = _to_np(D_B)
             D_B_aug = np.zeros((_nt_aug, _nt_aug), dtype=np.float64)
             D_B_aug[:nt, :nt] = D_B_np
-            # D_B_aug[nt, :] and D_B_aug[:, nt] stay 0
             D_B = nx.from_numpy(D_B_aug)
             if isinstance(nx, ot.backend.TorchBackend):
                 D_B = D_B.float()
 
-        # ---- Precompute per-type max cost from the same-type submatrix ----
+        # ---- Per-type max costs for dummy entries ----
         M1_np = _to_np(M1)
         M2_np = _to_np(M2)
         _type_M1_max = {}
@@ -458,93 +649,87 @@ def pairwise_align(
                 _type_M1_max[_type_k] = float(M1_np[np.ix_(_S, _T)].max())
                 _type_M2_max[_type_k] = float(M2_np[np.ix_(_S, _T)].max())
             else:
-                # Type absent on one side — fall back to global max
                 _type_M1_max[_type_k] = float(M1_np.max())
                 _type_M2_max[_type_k] = float(M2_np.max())
 
-        # Per-cell dummy costs: each cell pays the max of its own type's submatrix
         _death_M1 = np.array([_type_M1_max[_lab_A[i]] for i in range(ns)], dtype=np.float64)
         _birth_M1 = np.array([_type_M1_max[_lab_B[j]] for j in range(nt)], dtype=np.float64)
         _death_M2 = np.array([_type_M2_max[_lab_A[i]] for i in range(ns)], dtype=np.float64)
         _birth_M2 = np.array([_type_M2_max[_lab_B[j]] for j in range(nt)], dtype=np.float64)
-
         epsilon = 1e-6
 
-        # ---- Augment M1: add dummy row/col only where needed ----
         M1_aug = np.zeros((_ns_aug, _nt_aug), dtype=np.float64)
         M1_aug[:ns, :nt] = M1_np
         if _has_dummy_tgt:
-            M1_aug[:ns, nt] = _death_M1 + epsilon   # src cell i → dummy tgt: max within i's type
+            M1_aug[:ns, nt] = _death_M1 + epsilon
         if _has_dummy_src:
-            M1_aug[ns, :nt] = _birth_M1 + epsilon    # dummy src → tgt cell j: max within j's type
+            M1_aug[ns, :nt] = _birth_M1 + epsilon
         if _has_dummy_src and _has_dummy_tgt:
-            M1_aug[ns, nt] = np.max(M1_np) + epsilon           # dummy-to-dummy is free
+            M1_aug[ns, nt] = np.max(M1_np) + epsilon
         M1 = nx.from_numpy(M1_aug)
 
-        # ---- Augment M2: add dummy row/col only where needed ----
         M2_aug = np.zeros((_ns_aug, _nt_aug), dtype=np.float64)
         M2_aug[:ns, :nt] = M2_np
         if _has_dummy_tgt:
-            M2_aug[:ns, nt] = _death_M2 + epsilon   # src cell i → dummy tgt: max within i's type
+            M2_aug[:ns, nt] = _death_M2 + epsilon
         if _has_dummy_src:
-            M2_aug[ns, :nt] = _birth_M2 + epsilon    # dummy src → tgt cell j: max within j's type
+            M2_aug[ns, :nt] = _birth_M2 + epsilon
         if _has_dummy_src and _has_dummy_tgt:
-            M2_aug[ns, nt] = np.max(M2_np) + epsilon           # dummy-to-dummy is free
+            M2_aug[ns, nt] = np.max(M2_np) + epsilon
         M2 = nx.from_numpy(M2_aug)
 
         logFile.write(f"[dummy_cell] Augmented: D_A {tuple(D_A.shape)}, D_B {tuple(D_B.shape)}, "
                       f"M1 {tuple(M1.shape)}, M2 {tuple(M2.shape)}\n")
 
-    if isinstance(nx,ot.backend.TorchBackend) and use_gpu:
-        # M = M.cuda()
-
+    if isinstance(nx, ot.backend.TorchBackend) and use_gpu:
         M1 = M1.cuda()
         M2 = M2.cuda()
-        if dummy_cell and (_has_dummy_src or _has_dummy_tgt):
+        if _has_partial or (_has_dummy_src or _has_dummy_tgt):
             D_A = D_A.cuda()
             D_B = D_B.cuda()
-    
-    # init distributions
-    # ensure ns/nt exist for the following logic (used even when dummy_cell=True)
+
+    # ── Marginal distributions ────────────────────────────────────────────
     ns = sliceA.shape[0]
     nt = sliceB.shape[0]
 
-    # compute augmented dimensions for dummy-cell logic so the variables
-    # are always defined before they are referenced later (e.g. in the
-    # G_init branch). if no dummy cell was added the augmented sizes
-    # equal the original sizes.
-    _ns_aug = ns + (1 if _has_dummy_src else 0)
-    _nt_aug = nt + (1 if _has_dummy_tgt else 0)
-
     if a_distribution is None:
-        if dummy_cell:
+        if _has_partial:
+            # Partial FGW: real weights = m/ns, dummy weight = 1-m
+            a_vals      = np.full(ns + 1, _partial_m / ns, dtype=np.float64)
+            a_vals[-1]  = 1.0 - _partial_m
+            a = nx.from_numpy(a_vals)
+        elif dummy_cell:
             if _has_dummy_src:
-                a_vals = np.full(ns + 1, 1.0 / _budget, dtype=np.float64)
-                a_vals[-1] = float(_w_dummy_src) / _budget
+                a_vals      = np.full(ns + 1, 1.0 / _budget, dtype=np.float64)
+                a_vals[-1]  = float(_w_dummy_src) / _budget
                 a = nx.from_numpy(a_vals)
             else:
                 a = nx.ones((ns,), type_as=np.array([1.0], dtype=np.float64)) / _budget
         else:
-            # uniform distribution, a = array([1/n, 1/n, ...])
-            a = nx.ones((sliceA.shape[0],))/sliceA.shape[0]
+            a = nx.ones((sliceA.shape[0],)) / sliceA.shape[0]
     else:
-        if dummy_cell:
-            raise ValueError("Custom a_distribution is not supported with dummy_cell=True.")
+        if _has_partial or dummy_cell:
+            raise ValueError("Custom a_distribution is not supported with partial_fgw / dummy_cell.")
         a = nx.from_numpy(a_distribution)
-        
+
     if b_distribution is None:
-        if dummy_cell:
+        if _has_partial:
+            # Partial FGW: real weights = m/nt, dummy weight = 1-m
+            b_vals      = np.full(nt + 1, _partial_m / nt, dtype=np.float64)
+            b_vals[-1]  = 1.0 - _partial_m
+            b = nx.from_numpy(b_vals)
+        elif dummy_cell:
             if _has_dummy_tgt:
-                b_vals = np.full(nt + 1, 1.0 / _budget, dtype=np.float64)
-                b_vals[-1] = float(_w_dummy_tgt) / _budget
+                b_vals      = np.full(nt + 1, 1.0 / _budget, dtype=np.float64)
+                b_vals[-1]  = float(_w_dummy_tgt) / _budget
                 b = nx.from_numpy(b_vals)
             else:
                 b = nx.ones((nt,), type_as=np.array([1.0], dtype=np.float64)) / _budget
         else:
-            b = nx.ones((sliceB.shape[0],))/sliceB.shape[0]
+            b = nx.ones((sliceB.shape[0],)) / sliceB.shape[0]
     else:
-        if dummy_cell:
-            raise ValueError("Custom b_distribution is not supported with dummy_cell=True.")
+        if _has_partial or dummy_cell:
+            raise ValueError("Custom b_distribution is not supported with partial_fgw / dummy_cell.")
         b = nx.from_numpy(b_distribution)
 
     if isinstance(nx,ot.backend.TorchBackend) and use_gpu:
@@ -557,24 +742,20 @@ def pairwise_align(
     
     # Run OT
     if G_init is not None:
-        if dummy_cell and (_has_dummy_src or _has_dummy_tgt):
+        if _has_partial or (_has_dummy_src or _has_dummy_tgt):
             # Pad user-provided (ns x nt) G_init to augmented dims
-            _gi = np.array(G_init, dtype=np.float64)
+            _gi     = np.array(G_init, dtype=np.float64)
             _gi_aug = np.zeros((_ns_aug, _nt_aug), dtype=np.float64)
             _gi_aug[:ns, :nt] = _gi
-            G_init = _gi_aug
+            G_init  = _gi_aug
         G_init = nx.from_numpy(G_init)
-        if isinstance(nx,ot.backend.TorchBackend):
+        if isinstance(nx, ot.backend.TorchBackend):
             G_init = G_init.float()
             if use_gpu:
                 G_init = G_init.cuda()
 
-    if dummy_cell:
-        # Use original dims for initial objective logging
-        _ns_log, _nt_log = sliceA.shape[0], sliceB.shape[0]
-        G = np.ones((_ns_log, _nt_log)) / (_ns_log * _nt_log)
-    else:
-        G = np.ones((a.shape[0], b.shape[0])) / (a.shape[0] * b.shape[0])
+    # Initial objective uses original (unaugmented) dims for fair comparison
+    G = np.ones((ns, nt)) / (ns * nt)
 
     if neighborhood_dissimilarity == 'jsd':
         initial_obj_neighbor = np.sum(js_dist_neighborhood * G)
@@ -603,40 +784,59 @@ def pairwise_align(
     
 
     # D_A: pairwise dist matrix of sliceA spots coords
-    # a: initial distribution(uniform) of sliceA spots
-    _fgw_extra = {'numItermaxEmd': 500_000} if dummy_cell else {}
-    pi, logw = fused_gromov_wasserstein_incent(M1, M2, D_A, D_B, a, b, G_init = G_init, loss_fun='square_loss', alpha= alpha, gamma=gamma, log=True, numItermax=numItermax,verbose=verbose, use_gpu = use_gpu, **_fgw_extra)
+    # a: initial distribution of sliceA spots
+    _needs_emd = _has_partial or _has_dummy_src or _has_dummy_tgt
+    _fgw_extra = {'numItermaxEmd': 500_000} if _needs_emd else {}
+    pi, logw = fused_gromov_wasserstein_incent(
+        M1, M2, D_A, D_B, a, b,
+        G_init=G_init, loss_fun='square_loss',
+        alpha=alpha, gamma=gamma, log=True,
+        numItermax=numItermax, verbose=verbose,
+        use_gpu=use_gpu, **_fgw_extra
+    )
     pi = nx.to_numpy(pi)
-    # obj = nx.to_numpy(logw['fgw_dist'])
 
-    # ── Dummy cell: strip dummy row/col, renormalize, report birth/death ────
-    if dummy_cell and (_has_dummy_src or _has_dummy_tgt):
-        # make sure the base sizes are available even if the earlier
-        # `if dummy_cell:` block did not execute
-        ns, nt = sliceA.shape[0], sliceB.shape[0]
+    # ── Strip dummy row/col and renormalize ───────────────────────────────
+    if _has_partial:
+        # Both a dummy row (ns) and a dummy col (nt) are always present
+        pi_full    = pi.copy()
+        death_mass = float(pi_full[:ns, nt].sum())   # src sent to dummy tgt
+        birth_mass = float(pi_full[ns, :nt].sum())   # tgt received from dummy src
+        pi         = pi_full[:ns, :nt]
+        pi_sum     = float(pi.sum())
+        if pi_sum > 0:
+            pi = pi / pi_sum
+        logFile.write(
+            f"[partial_fgw] death_mass={death_mass:.6f}, birth_mass={birth_mass:.6f}, "
+            f"real_to_real_mass={pi_sum:.6f} (renormalized to 1.0)\n"
+        )
+        print(
+            f"[partial_fgw] death_mass: {death_mass:.6f}, birth_mass: {birth_mass:.6f}, "
+            f"real_to_real_mass: {pi_sum:.6f} (renormalized to 1.0)"
+        )
+
+    elif dummy_cell and (_has_dummy_src or _has_dummy_tgt):
+        ns, nt  = sliceA.shape[0], sliceB.shape[0]
         pi_full = pi.copy()
-
-        # Compute birth / death mass before stripping
         birth_mass = float(pi_full[-1, :nt].sum()) if _has_dummy_src else 0.0
         death_mass = float(pi_full[:ns, -1].sum()) if _has_dummy_tgt else 0.0
-
-        # Strip only the dummy row/col that was actually added
         if _has_dummy_src and _has_dummy_tgt:
             pi = pi_full[:ns, :nt]
         elif _has_dummy_src:
-            pi = pi_full[:ns, :]      # strip dummy source row only
+            pi = pi_full[:ns, :]
         elif _has_dummy_tgt:
-            pi = pi_full[:, :nt]      # strip dummy target col only
-
-        # Renormalize so pi sums to 1 (fair comparison with balanced baseline)
-        pi_sum = pi.sum()
+            pi = pi_full[:, :nt]
+        pi_sum = float(pi.sum())
         if pi_sum > 0:
             pi = pi / pi_sum
-
-        logFile.write(f"[dummy_cell] death_mass={death_mass:.6f}, birth_mass={birth_mass:.6f}, "
-                      f"real_mass_before_norm={pi_sum:.6f}\n")
-        print(f"[dummy_cell] death_mass: {death_mass:.6f}, birth_mass: {birth_mass:.6f}, "
-              f"real_to_real_mass: {pi_sum:.6f} (renormalized to 1.0)")
+        logFile.write(
+            f"[dummy_cell] death_mass={death_mass:.6f}, birth_mass={birth_mass:.6f}, "
+            f"real_mass_before_norm={pi_sum:.6f}\n"
+        )
+        print(
+            f"[dummy_cell] death_mass: {death_mass:.6f}, birth_mass: {birth_mass:.6f}, "
+            f"real_to_real_mass: {pi_sum:.6f} (renormalized to 1.0)"
+        )
 
     if neighborhood_dissimilarity == 'jsd':
         max_indices = np.argmax(pi, axis=1)
