@@ -95,7 +95,7 @@ def fused_gromov_wasserstein_incent(M1, M2, C1, C2, p, q, gamma, G_init = None, 
 
     if log:
    
-        res, log = cg_incent(p, q, (1 - alpha) * M1, (1 - alpha) * M2, alpha, f, df, gamma = gamma, G0 = G0, line_search = line_search, log=True, numItermax=numItermax, stopThr=tol_rel, stopThr2=tol_abs, **kwargs)
+        res, log = cg_incent(p, q, M1, M2, alpha, f, df, gamma = gamma, G0 = G0, line_search = line_search, log=True, numItermax=numItermax, stopThr=tol_rel, stopThr2=tol_abs, **kwargs)
 
         fgw_dist = log['loss'][-1]
 
@@ -105,7 +105,7 @@ def fused_gromov_wasserstein_incent(M1, M2, C1, C2, p, q, gamma, G_init = None, 
         return res, log
 
     else:
-        return cg_incent(p, q, (1 - alpha) * M1, (1 - alpha) * M2, alpha, f, df, gamma = gamma, G0 = G0, line_search = line_search, log=True, numItermax=numItermax, stopThr=tol_rel, stopThr2=tol_abs, **kwargs)
+        return cg_incent(p, q, M1, M2, alpha, f, df, gamma = gamma, G0 = G0, line_search = line_search, log=True, numItermax=numItermax, stopThr=tol_rel, stopThr2=tol_abs, **kwargs)
 
 
 def solve_gromov_linesearch(G, deltaG, cost_G, C1, C2, M, reg,
@@ -338,7 +338,7 @@ def generic_conditional_gradient_incent(a, b, M1, M2, f, df, reg1, reg2, lp_solv
         alpha = reg1
         
         # with niche aware
-        return (1-alpha) * (nx.sum(M1 * G) + gamma * nx.sum(M2 * G)) + alpha * f(G)
+        return (1-alpha) * ((1 - gamma) * nx.sum(M1 * G) + gamma * nx.sum(M2 * G)) + alpha * f(G)
 
         # without niche aware
         # return (1-alpha) * (nx.sum(M1 * G)) + alpha * f(G)
@@ -364,7 +364,7 @@ def generic_conditional_gradient_incent(a, b, M1, M2, f, df, reg1, reg2, lp_solv
         # gradient descent
         # M2 (JSD/neighborhood) must be in the gradient for it to drive
         # the FW direction, not just the line search cost evaluation.
-        Mi = M1 + gamma * M2 + reg1 * df(G)
+        Mi = (1 - gamma) * M1 + gamma * M2 + reg1 * df(G)
 
         if not (reg2 is None):
             Mi = Mi + reg2 * (1 + nx.log(G))

@@ -159,7 +159,7 @@ def pairwise_align(
     _lab_A = np.asarray(sliceA.obs['cell_type_annot'].values)
     _lab_B = np.asarray(sliceB.obs['cell_type_annot'].values)
     M_celltype = (_lab_A[:, None] != _lab_B[None, :]).astype(np.float64)
-    M1_combined = cosine_dist_gene_expr + beta * M_celltype
+    M1_combined = (1-beta) * cosine_dist_gene_expr + beta * M_celltype
     logFile.write(f"[cell_type_penalty] beta={beta}, M_celltype shape={M_celltype.shape}\n")
 
 
