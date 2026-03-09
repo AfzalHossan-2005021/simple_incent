@@ -323,30 +323,50 @@ def pairwise_align(
             if isinstance(nx, ot.backend.TorchBackend):
                 D_B = D_B.float()
 
-        # ---- Augment M1: add dummy row/col only where needed ----
+        # ---- Precompute per-type max cost from the same-type submatrix ----
         M1_np = _to_np(M1)
+        M2_np = _to_np(M2)
+        _type_M1_max = {}
+        _type_M2_max = {}
+        for _type_k in all_types:
+            _S = np.where(_lab_A == _type_k)[0]
+            _T = np.where(_lab_B == _type_k)[0]
+            if len(_S) > 0 and len(_T) > 0:
+                _type_M1_max[_type_k] = float(M1_np[np.ix_(_S, _T)].max())
+                _type_M2_max[_type_k] = float(M2_np[np.ix_(_S, _T)].max())
+            else:
+                # Type absent on one side — fall back to global max
+                _type_M1_max[_type_k] = float(M1_np.max())
+                _type_M2_max[_type_k] = float(M2_np.max())
+
+        # Per-cell dummy costs: each cell pays the max of its own type's submatrix
+        _death_M1 = np.array([_type_M1_max[_lab_A[i]] for i in range(ns)], dtype=np.float64)
+        _birth_M1 = np.array([_type_M1_max[_lab_B[j]] for j in range(nt)], dtype=np.float64)
+        _death_M2 = np.array([_type_M2_max[_lab_A[i]] for i in range(ns)], dtype=np.float64)
+        _birth_M2 = np.array([_type_M2_max[_lab_B[j]] for j in range(nt)], dtype=np.float64)
+
+        epsilon = 1e-6
+
+        # ---- Augment M1: add dummy row/col only where needed ----
         M1_aug = np.zeros((_ns_aug, _nt_aug), dtype=np.float64)
         M1_aug[:ns, :nt] = M1_np
         if _has_dummy_tgt:
-            # Dummy target column: mean cost of real source i → death
-            M1_aug[:ns, nt] = M1_np.mean(axis=1)
+            M1_aug[:ns, nt] = _death_M1 + epsilon   # src cell i → dummy tgt: max within i's type
         if _has_dummy_src:
-            # Dummy source row: mean cost of birth → real target j
-            M1_aug[ns, :nt] = M1_np.mean(axis=0)
+            M1_aug[ns, :nt] = _birth_M1 + epsilon    # dummy src → tgt cell j: max within j's type
         if _has_dummy_src and _has_dummy_tgt:
-            M1_aug[ns, nt] = 0.0  # dummy-to-dummy is free
+            M1_aug[ns, nt] = np.max(M1_np) + epsilon           # dummy-to-dummy is free
         M1 = nx.from_numpy(M1_aug)
 
         # ---- Augment M2: add dummy row/col only where needed ----
-        M2_np = _to_np(M2)
         M2_aug = np.zeros((_ns_aug, _nt_aug), dtype=np.float64)
         M2_aug[:ns, :nt] = M2_np
         if _has_dummy_tgt:
-            M2_aug[:ns, nt] = M2_np.mean(axis=1)
+            M2_aug[:ns, nt] = _death_M2 + epsilon   # src cell i → dummy tgt: max within i's type
         if _has_dummy_src:
-            M2_aug[ns, :nt] = M2_np.mean(axis=0)
+            M2_aug[ns, :nt] = _birth_M2 + epsilon    # dummy src → tgt cell j: max within j's type
         if _has_dummy_src and _has_dummy_tgt:
-            M2_aug[ns, nt] = 0.0
+            M2_aug[ns, nt] = np.max(M2_np) + epsilon           # dummy-to-dummy is free
         M2 = nx.from_numpy(M2_aug)
 
         logFile.write(f"[dummy_cell] Augmented: D_A {tuple(D_A.shape)}, D_B {tuple(D_B.shape)}, "
