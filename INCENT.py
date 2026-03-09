@@ -14,6 +14,95 @@ from sklearn.metrics.pairwise import euclidean_distances
 from .utils import fused_gromov_wasserstein_incent, to_dense_array, extract_data_matrix, jensenshannon_divergence_backend, pairwise_msd
 
 
+# ── Hemisphere pre-selection helper ──────────────────────────────────────────
+def _icp_hemisphere_select(
+    sliceA: AnnData,
+    sliceB: AnnData,
+    allow_reflection: bool = False,
+    logFile=None,
+) -> AnnData:
+    """
+    Detect the left / right hemispheres in sliceB (target) by k-means on the
+    mediolateral (x) coordinate, then pick the hemisphere whose spatial point
+    cloud best matches sliceA via translation-only ICP.
+
+    Translation-only ICP is used (no reflection allowed by default) because
+    both hemispheres are mirror images: allowing reflection would remove the
+    spatial signal that distinguishes them.  If ``allow_reflection=True`` the
+    x-reflected variant of sliceA is also tried (in case the source section
+    was acquired in the opposite orientation).
+
+    Returns
+    -------
+    AnnData
+        Subset of sliceB corresponding to the best-matching hemisphere.
+    """
+    from sklearn.cluster import KMeans
+    from sklearn.neighbors import NearestNeighbors
+
+    coords_A = sliceA.obsm['spatial'].astype(np.float64)
+    coords_B = sliceB.obsm['spatial'].astype(np.float64)
+
+    # ── Step 1: split target into left / right by x-coordinate ──────────
+    km = KMeans(n_clusters=2, n_init=20, random_state=0).fit(coords_B[:, 0:1])
+    labels = km.labels_.copy()
+    # Ensure label 0 = left (lower mean x)
+    if coords_B[labels == 0, 0].mean() > coords_B[labels == 1, 0].mean():
+        labels = 1 - labels
+    left_mask  = (labels == 0)
+    right_mask = (labels == 1)
+
+    n_left  = int(left_mask.sum())
+    n_right = int(right_mask.sum())
+
+    # ── Step 2: translation-only ICP residual ───────────────────────────
+    def _icp_residual(src: np.ndarray, tgt: np.ndarray,
+                      max_iter: int = 60, tol: float = 1e-6) -> float:
+        """Return mean NN distance after translation-only ICP alignment."""
+        src = src.copy()
+        nbrs_fit = NearestNeighbors(n_neighbors=1, algorithm='kd_tree')
+        for _ in range(max_iter):
+            nbrs_fit.fit(tgt)
+            dists, idx = nbrs_fit.kneighbors(src)
+            matched = tgt[idx.flatten()]
+            t = matched.mean(axis=0) - src.mean(axis=0)
+            src += t
+            if np.linalg.norm(t) < tol:
+                break
+        nbrs_fit.fit(tgt)
+        final_dists, _ = nbrs_fit.kneighbors(src)
+        return float(final_dists.mean())
+
+    # Build candidate list: (residual, mask, description)
+    candidates = [
+        (_icp_residual(coords_A, coords_B[left_mask]),  left_mask,  'left'),
+        (_icp_residual(coords_A, coords_B[right_mask]), right_mask, 'right'),
+    ]
+    if allow_reflection:
+        coords_A_ref = coords_A.copy()
+        coords_A_ref[:, 0] = -coords_A_ref[:, 0]   # reflect along mediolateral axis
+        candidates += [
+            (_icp_residual(coords_A_ref, coords_B[left_mask]),  left_mask,  'left (x-reflected)'),
+            (_icp_residual(coords_A_ref, coords_B[right_mask]), right_mask, 'right (x-reflected)'),
+        ]
+
+    # ── Step 3: pick the winner ──────────────────────────────────────────
+    best_res, best_mask, best_side = min(candidates, key=lambda c: c[0])
+
+    res_summary = ', '.join(f"{desc}={res:.3f}" for res, _, desc in candidates)
+    msg = (
+        f"[hemisphere_select] ICP residuals: {res_summary}\n"
+        f"[hemisphere_select] Selected '{best_side}' "
+        f"(n={int(best_mask.sum())} cells, "
+        f"left={n_left}, right={n_right})"
+    )
+    print(msg)
+    if logFile is not None:
+        logFile.write(msg + "\n")
+
+    return sliceB[best_mask]
+
+
 def pairwise_align(
     sliceA: AnnData, 
     sliceB: AnnData, 
@@ -38,6 +127,8 @@ def pairwise_align(
     overwrite = False,
     neighborhood_dissimilarity: str='jsd',
     dummy_cell: bool = True,
+    select_hemisphere: bool = False,
+    allow_reflection: bool = False,
     **kwargs) -> Union[NDArray[np.floating], Tuple[NDArray[np.floating], float, float, float, float]]:
     """
 
@@ -65,6 +156,14 @@ def pairwise_align(
         return_obj: If ``True``, additionally returns objective function output of FGW-OT.
         verbose: If ``True``, FGW-OT is verbose.
         gpu_verbose: If ``True``, print whether gpu is being used to user.
+        select_hemisphere: If ``True``, automatically detect left/right hemispheres in
+            sliceB by k-means on the mediolateral (x) coordinate and select the
+            hemisphere whose spatial point cloud best matches sliceA via
+            translation-only ICP.  Solves the bilateral-symmetry problem when the
+            source is one hemisphere and the target is a full coronal section.
+        allow_reflection: Used only when ``select_hemisphere=True``.  If ``True``,
+            also tries the x-reflected source as a candidate (handles acquisitions
+            where the source section was scanned in the opposite orientation).
    
     Returns:
         - Alignment of spots.
@@ -94,6 +193,13 @@ def pairwise_align(
     logFile.write(f"beta: {beta}\n")
     logFile.write(f"gamma: {gamma}\n")
     logFile.write(f"radius: {radius}\n")
+    
+    # pre‑declare the three possible neighbourhood distance arrays so that
+    # static analysers know the names exist; actual values are filled in
+    # in the block handling `neighborhood_dissimilarity`.
+    js_dist_neighborhood = None
+    msd_neighborhood = None
+    cosine_dist_neighborhood = None
 
 
     
@@ -123,7 +229,21 @@ def pairwise_align(
         if not len(s):
             raise ValueError(f"Found empty `AnnData`:\n{s}.")
 
-    
+    # ── Hemisphere pre-selection ───────────────────────────────────────────────
+    # When sliceB is a full bilateral section (two hemispheres) and sliceA is
+    # one hemisphere, FGW mixes L/R because both hemispheres have the same
+    # pairwise distance structure (bilateral symmetry).  The only signal that
+    # can distinguish them is absolute spatial geometry, detected here via ICP.
+    if select_hemisphere:
+        logFile.write("[hemisphere_select] Running ICP hemisphere pre-selection\n")
+        logFile.write(f"[hemisphere_select] sliceB before selection: {sliceB.shape[0]} cells\n")
+        sliceB = _icp_hemisphere_select(
+            sliceA, sliceB,
+            allow_reflection=allow_reflection,
+            logFile=logFile,
+        )
+        logFile.write(f"[hemisphere_select] sliceB after selection: {sliceB.shape[0]} cells\n")
+
     # Backend
     nx = backend    
     
@@ -270,6 +390,9 @@ def pairwise_align(
     # _has_dummy_tgt: True if target has fewer cells → need dummy target (death)
     _has_dummy_src = False
     _has_dummy_tgt = False
+    _budget = 0
+    _w_dummy_src = 0
+    _w_dummy_tgt = 0
 
     if dummy_cell:
         from collections import Counter
@@ -382,6 +505,17 @@ def pairwise_align(
             D_B = D_B.cuda()
     
     # init distributions
+    # ensure ns/nt exist for the following logic (used even when dummy_cell=True)
+    ns = sliceA.shape[0]
+    nt = sliceB.shape[0]
+
+    # compute augmented dimensions for dummy-cell logic so the variables
+    # are always defined before they are referenced later (e.g. in the
+    # G_init branch). if no dummy cell was added the augmented sizes
+    # equal the original sizes.
+    _ns_aug = ns + (1 if _has_dummy_src else 0)
+    _nt_aug = nt + (1 if _has_dummy_tgt else 0)
+
     if a_distribution is None:
         if dummy_cell:
             if _has_dummy_src:
@@ -443,11 +577,13 @@ def pairwise_align(
         G = np.ones((a.shape[0], b.shape[0])) / (a.shape[0] * b.shape[0])
 
     if neighborhood_dissimilarity == 'jsd':
-        initial_obj_neighbor = np.sum(js_dist_neighborhood*G)
-    if neighborhood_dissimilarity == 'msd':
-        initial_obj_neighbor = np.sum(msd_neighborhood*G)
+        initial_obj_neighbor = np.sum(js_dist_neighborhood * G)
+    elif neighborhood_dissimilarity == 'msd':
+        initial_obj_neighbor = np.sum(msd_neighborhood * G)
     elif neighborhood_dissimilarity == 'cosine':
-        initial_obj_neighbor = np.sum(cosine_dist_neighborhood*G)
+        initial_obj_neighbor = np.sum(cosine_dist_neighborhood * G)
+    else:
+        raise ValueError(f"Unsupported neighborhood_dissimilarity: {neighborhood_dissimilarity!r}")
 
     initial_obj_gene = np.sum(cosine_dist_gene_expr*G)
 
@@ -475,6 +611,9 @@ def pairwise_align(
 
     # ── Dummy cell: strip dummy row/col, renormalize, report birth/death ────
     if dummy_cell and (_has_dummy_src or _has_dummy_tgt):
+        # make sure the base sizes are available even if the earlier
+        # `if dummy_cell:` block did not execute
+        ns, nt = sliceA.shape[0], sliceB.shape[0]
         pi_full = pi.copy()
 
         # Compute birth / death mass before stripping
