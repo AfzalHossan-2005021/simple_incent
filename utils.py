@@ -7,6 +7,10 @@ import numpy as np
 import scipy.sparse as sp
 from tqdm import tqdm
 
+from typing import List, Tuple, Optional
+from anndata import AnnData
+import matplotlib.pyplot as plt
+
 from ot.lp import emd
 from ot.optim import line_search_armijo
 from ot.utils import list_to_array, get_backend
