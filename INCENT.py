@@ -14,6 +14,85 @@ from sklearn.metrics.pairwise import euclidean_distances
 from .utils import fused_gromov_wasserstein_incent, to_dense_array, extract_data_matrix, jensenshannon_divergence_backend, pairwise_msd
 
 
+# ── Spatial proximity prior helper ──────────────────────────────────────────
+def _spatial_prior_cost(
+    coords_A: np.ndarray,
+    coords_B: np.ndarray,
+    n_icp_iter: int = 60,
+) -> np.ndarray:
+    """
+    Compute a normalised spatial proximity cost matrix M_spatial ∈ [0,1] of
+    shape (ns, nt) between source and target cells.
+
+    Mathematical foundation
+    -----------------------
+    Absolute spatial coordinates carry the one signal that molecular profiles
+    cannot: which side of the brain atlas a cell sits on.  Adding this as a
+    linear term in the FGW cost function makes cross-hemisphere matches
+    expensive and same-hemisphere / same-region matches cheap, naturally
+    steering the OT plan toward geometrically coherent matchings without any
+    hard prefiltering or prior knowledge of overlap geometry.
+
+        M_total = (1 - spatial_weight) * M_molecular + spatial_weight * M_spatial
+
+    This is a principled Fused approach: M_molecular captures cell-identity;
+    M_spatial captures positional coherence.  Together they break bilateral
+    symmetry and handle all partial-overlap scenarios.
+
+    Pre-alignment via translation-only ICP
+    ----------------------------------------
+    Raw coordinates from different MERFISH sessions may be offset by an
+    unknown translation (different acquisition origins, z-stacks, cropping).
+    A translation-only ICP (no rotation, no reflection) is run first to
+    remove this offset before computing spatial distances.
+
+    Rotation is deliberately excluded: allowing rotation would let ICP fold
+    the source onto the mirror hemisphere, creating an incorrect prior.  The
+    ICP purely aligns the centroid of the source cloud to the nearest-matching
+    sub-region of the target.
+
+    Parameters
+    ----------
+    coords_A : (ns, 2) ndarray of float64
+        Absolute spatial coordinates of source cells.
+    coords_B : (nt, 2) ndarray of float64
+        Absolute spatial coordinates of target cells.
+    n_icp_iter : int
+        Maximum translation-only ICP iterations (default 60).
+
+    Returns
+    -------
+    ndarray, shape (ns, nt), values in [0.0, 1.0]
+        M_spatial[i, j] = 0  → source cell i and target cell j coincide
+        M_spatial[i, j] = 1  → maximally distant pair in the data
+    """
+    from sklearn.neighbors import NearestNeighbors
+    from sklearn.metrics.pairwise import euclidean_distances as _euc
+
+    src = coords_A.astype(np.float64).copy()
+    tgt = coords_B.astype(np.float64)
+
+    # ── Translation-only ICP ───────────────────────────────────────────────
+    # Iteratively shift src centroid toward the closest cluster of tgt cells.
+    # Converges when the required translation is < 1e-6 (sub-pixel precision).
+    nbrs = NearestNeighbors(n_neighbors=1, algorithm='kd_tree')
+    for _ in range(n_icp_iter):
+        nbrs.fit(tgt)
+        _, idx = nbrs.kneighbors(src)
+        matched = tgt[idx.flatten()]
+        t = matched.mean(axis=0) - src.mean(axis=0)
+        src = src + t
+        if np.linalg.norm(t) < 1e-6:
+            break
+
+    # ── Pairwise Euclidean distances (aligned source vs original target) ───
+    D     = _euc(src, tgt)
+    d_max = float(D.max())
+    if d_max > 1e-12:
+        D = D / d_max
+    return D.astype(np.float64)
+
+
 # ── Overlap-fraction estimation helper ─────────────────────────────────────
 def _estimate_overlap_fraction(
     M_lin: np.ndarray,
@@ -215,6 +294,7 @@ def pairwise_align(
     allow_reflection: bool = False,
     overlap_fraction: Optional[float] = None,
     auto_overlap: bool = True,
+    spatial_weight: float = 0.0,
     **kwargs) -> Union[NDArray[np.floating], Tuple[NDArray[np.floating], float, float, float, float]]:
     """
 
@@ -263,6 +343,27 @@ def pairwise_align(
             FGW.  Uses a 1-D Gaussian Mixture Model on per-cell best-match costs
             (see ``_estimate_overlap_fraction``).  Recommended for all real
             experiments.  Overrides ``dummy_cell`` if the estimate is < 1.0.
+        spatial_weight: Weight δ ∈ [0, 1) for the absolute-coordinates proximity
+            term added into the linear cost M.  When > 0 the effective cost becomes:
+
+                M_eff = (1 - δ) * M_molecular + δ * M_spatial
+
+            where M_spatial is a normalised pairwise Euclidean distance matrix
+            computed from the ABSOLUTE spatial coordinates of the cells after a
+            translation-only ICP pre-alignment (see ``_spatial_prior_cost``).
+
+            This is the **only signal that can break bilateral symmetry** in the
+            mouse brain: gene expression and cellular neighbourhoods are symmetric,
+            but absolute atlas positions are not.  A value of 0.3–0.5 is generally
+            sufficient to prevent hemisphere mixing while still letting molecular
+            signals dominate.
+
+            Generalises to all scenarios:
+              • both-full / same region:     M_spatial ≈ uniform → no harm
+              • half+full (bilateral target): strongly penalises wrong hemisphere
+              • arbitrary partial overlap:    steers OT toward the geometrically
+                                              overlapping sub-region
+            Default: 0.0 (disabled, backward-compatible).
    
     Returns:
         - Alignment of spots.
@@ -381,6 +482,27 @@ def pairwise_align(
     M1_combined = (1-beta) * cosine_dist_gene_expr + beta * M_celltype
     logFile.write(f"[cell_type_penalty] beta={beta}, M_celltype shape={M_celltype.shape}\n")
 
+    # ── Spatial proximity prior ─────────────────────────────────────────────
+    # Inject an absolute-coordinate distance term into the linear cost.
+    # This is the *only* signal that can break bilateral symmetry because
+    # gene expression and cellular neighbourhoods are bilaterally symmetric.
+    # The ICP pre-alignment inside _spatial_prior_cost removes any acquisition
+    # translation offset before computing distances, so this works even when
+    # the two sections were imaged in different coordinate frames.
+    if spatial_weight > 0.0:
+        _sw = float(np.clip(spatial_weight, 0.0, 1.0))
+        _coords_A_raw = sliceA.obsm['spatial'].astype(np.float64)
+        _coords_B_raw = sliceB.obsm['spatial'].astype(np.float64)
+        _M_spatial    = _spatial_prior_cost(_coords_A_raw, _coords_B_raw, n_icp_iter=60)
+        M1_combined   = (1.0 - _sw) * M1_combined + _sw * _M_spatial
+        _sp_msg = (
+            f"[spatial_prior] spatial_weight={_sw:.3f}, "
+            f"M_spatial shape={_M_spatial.shape}, "
+            f"min={_M_spatial.min():.4f}, max={_M_spatial.max():.4f}, "
+            f"mean={_M_spatial.mean():.4f}"
+        )
+        print(_sp_msg)
+        logFile.write(_sp_msg + "\n")
 
     M1 = nx.from_numpy(M1_combined)
 

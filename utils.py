@@ -625,3 +625,133 @@ to_dense_array = lambda X: X.toarray() if sp.issparse(X) else np.asarray(X)
 ## Returns the data matrix or representation
 extract_data_matrix = lambda adata,rep: adata.X if rep is None else adata.obsm[rep]
 
+
+def visualize_alignment(sliceA, sliceB, pi12):
+    slices, pis = [sliceA, sliceB], [pi12]
+    new_slices = stack_slices_pairwise(slices, pis)
+
+    slice_colors = ['#e41a1c','#377eb8']
+
+    xI_new = new_slices[0].obsm['spatial'][:, 0]
+    yI_new = new_slices[0].obsm['spatial'][:, 1]
+
+    xJ_new = new_slices[1].obsm['spatial'][:, 0]
+    yJ_new = new_slices[1].obsm['spatial'][:, 1]
+
+    print("====================\nAligned slices")
+
+    plt.scatter(xI_new,yI_new,s=1,alpha=0.5, label='source', c=slice_colors[0])
+    plt.scatter(xJ_new,yJ_new,s=1,alpha=0.5, label = 'target', c=slice_colors[1])
+    plt.axis("off")
+    plt.legend()
+    plt.show()
+
+    return new_slices
+
+
+def stack_slices_pairwise(
+    slices: List[AnnData],
+    pis: List[np.ndarray],
+    output_params: bool = False,
+    matrix: bool = False
+) -> Tuple[List[AnnData], Optional[List[float]], Optional[List[np.ndarray]]]:
+    """
+    Align spatial coordinates of sequential pairwise slices.
+
+    In other words, align:
+
+        slices[0] --> slices[1] --> slices[2] --> ...
+
+    Args:
+        slices: List of slices.
+        pis: List of pi (``pairwise_align()`` output) between consecutive slices.
+        output_params: If ``True``, addtionally return angles of rotation (theta) and translations for each slice.
+        matrix: If ``True`` and output_params is also ``True``, the rotation is
+            return as a matrix instead of an angle for each slice.
+
+    Returns:
+        - List of slices with aligned spatial coordinates.
+
+        If ``output_params = True``, additionally return:
+
+        - List of angles of rotation (theta) for each slice.
+        - List of translations [x_translation, y_translation] for each slice.
+    """
+    assert len(slices) == len(pis) + 1, "'slices' should have length one more than 'pis'. Please double check."
+    assert len(slices) > 1, "You should have at least 2 layers."
+    new_coor = []
+    thetas = []
+    translations = []
+    if not output_params:
+        S1, S2  = generalized_procrustes_analysis(slices[0].obsm['spatial'], slices[1].obsm['spatial'], pis[0])
+    else:
+        S1, S2,theta,tX,tY  = generalized_procrustes_analysis(slices[0].obsm['spatial'], slices[1].obsm['spatial'], pis[0],output_params=output_params, matrix=matrix)
+        thetas.append(theta)
+        translations.append(tX)
+        translations.append(tY)
+    new_coor.append(S1)
+    new_coor.append(S2)
+    for i in range(1, len(slices) - 1):
+        if not output_params:
+            x, y = generalized_procrustes_analysis(new_coor[i], slices[i+1].obsm['spatial'], pis[i])
+        else:
+            x, y,theta,tX,tY = generalized_procrustes_analysis(new_coor[i], slices[i+1].obsm['spatial'], pis[i],output_params=output_params, matrix=matrix)
+            thetas.append(theta)
+            translations.append(tY)
+        new_coor.append(y)
+
+    new_slices = []
+    for i in range(len(slices)):
+        s = slices[i].copy()
+        s.obsm['spatial'] = new_coor[i]
+        new_slices.append(s)
+
+    if not output_params:
+        return new_slices
+    else:
+        return new_slices, thetas, translations
+
+
+
+def generalized_procrustes_analysis(X, Y, pi, output_params = False, matrix = False):
+    """
+    Finds and applies optimal rotation between spatial coordinates of two layers (may also do a reflection).
+
+    Args:
+        X: np array of spatial coordinates (ex: sliceA.obs['spatial'])
+        Y: np array of spatial coordinates (ex: sliceB.obs['spatial'])
+        pi: mapping between the two layers output by PASTE
+        output_params: Boolean of whether to return rotation angle and translations along with spatial coordiantes.
+        matrix: Boolean of whether to return the rotation as a matrix or an angle.
+
+
+    Returns:
+        Aligned spatial coordinates of X, Y, rotation angle, translation of X, translation of Y.
+    """
+
+    # call the method: generalized_procrustes_analysis(slices[0].obsm['spatial'], slices[1].obsm['spatial'], pis[0])
+
+    assert X.shape[1] == 2 and Y.shape[1] == 2
+
+    # translate to origin
+    tX = pi.sum(axis=1).dot(X)
+    tY = pi.sum(axis=0).dot(Y)
+    X = X - tX
+    Y = Y - tY
+
+
+    H = Y.T.dot(pi.T.dot(X))
+
+    U, S, Vt = np.linalg.svd(H)
+    R = Vt.T.dot(U.T)
+    Y = R.dot(Y.T).T
+    if output_params and not matrix:
+        M = np.array([[0,-1],[1,0]])
+        theta = np.arctan(np.trace(M.dot(H))/np.trace(H))
+        return X,Y,theta,tX,tY
+    elif output_params and matrix:
+        return X, Y, R, tX, tY
+    else:
+        return X,Y
+
+
