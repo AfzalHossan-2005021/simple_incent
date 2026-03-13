@@ -4,266 +4,246 @@ import time
 import torch
 import datetime
 import numpy as np
+import pandas as pd
 
 from tqdm import tqdm
 from anndata import AnnData
 from numpy.typing import NDArray
 from typing import Optional, Tuple, Union
 from sklearn.metrics.pairwise import euclidean_distances
+from sklearn.mixture import GaussianMixture
 
 from .utils import fused_gromov_wasserstein_incent, to_dense_array, extract_data_matrix, jensenshannon_divergence_backend, pairwise_msd
 
 
-# ── Spatial proximity prior helper ──────────────────────────────────────────
-def _spatial_prior_cost(
-    coords_A: np.ndarray,
-    coords_B: np.ndarray,
-    n_icp_iter: int = 60,
-) -> np.ndarray:
+def _safe_normalize_rows(X: np.ndarray, eps: float = 1e-12) -> np.ndarray:
+    """Row-normalize a matrix while avoiding division-by-zero."""
+    X = np.asarray(X, dtype=np.float64)
+    den = X.sum(axis=1, keepdims=True)
+    den = np.maximum(den, eps)
+    return X / den
+
+
+def _dense_expr_matrix(curr_slice: AnnData, use_rep: Optional[str]) -> np.ndarray:
+    """Extract dense feature matrix for clustering/portion profiling."""
+    X = to_dense_array(extract_data_matrix(curr_slice, use_rep))
+    X = np.asarray(X, dtype=np.float64)
+    if X.ndim != 2:
+        raise ValueError(f"Expected 2D feature matrix, got shape {X.shape}.")
+    return X
+
+
+def _celltype_one_hot(labels: np.ndarray, categories: np.ndarray) -> np.ndarray:
+    """One-hot encoding for cell type labels against a fixed category set."""
+    cat_to_id = {c: i for i, c in enumerate(categories)}
+    out = np.zeros((labels.shape[0], len(categories)), dtype=np.float64)
+    for i, lab in enumerate(labels):
+        j = cat_to_id.get(lab, None)
+        if j is not None:
+            out[i, j] = 1.0
+    return out
+
+
+def _discover_portions(
+    curr_slice: AnnData,
+    use_rep: Optional[str],
+    max_portions: int,
+    min_portion_size: int,
+    random_state: int,
+) -> Tuple[np.ndarray, np.ndarray, int]:
     """
-    Compute a normalised spatial proximity cost matrix M_spatial ∈ [0,1] of
-    shape (ns, nt) between source and target cells.
-
-    Mathematical foundation
-    -----------------------
-    Absolute spatial coordinates carry the one signal that molecular profiles
-    cannot: which side of the brain atlas a cell sits on.  Adding this as a
-    linear term in the FGW cost function makes cross-hemisphere matches
-    expensive and same-hemisphere / same-region matches cheap, naturally
-    steering the OT plan toward geometrically coherent matchings without any
-    hard prefiltering or prior knowledge of overlap geometry.
-
-        M_total = (1 - spatial_weight) * M_molecular + spatial_weight * M_spatial
-
-    This is a principled Fused approach: M_molecular captures cell-identity;
-    M_spatial captures positional coherence.  Together they break bilateral
-    symmetry and handle all partial-overlap scenarios.
-
-    Pre-alignment via translation-only ICP
-    ----------------------------------------
-    Raw coordinates from different MERFISH sessions may be offset by an
-    unknown translation (different acquisition origins, z-stacks, cropping).
-    A translation-only ICP (no rotation, no reflection) is run first to
-    remove this offset before computing spatial distances.
-
-    Rotation is deliberately excluded: allowing rotation would let ICP fold
-    the source onto the mirror hemisphere, creating an incorrect prior.  The
-    ICP purely aligns the centroid of the source cloud to the nearest-matching
-    sub-region of the target.
-
-    Parameters
-    ----------
-    coords_A : (ns, 2) ndarray of float64
-        Absolute spatial coordinates of source cells.
-    coords_B : (nt, 2) ndarray of float64
-        Absolute spatial coordinates of target cells.
-    n_icp_iter : int
-        Maximum translation-only ICP iterations (default 60).
+    Discover an unknown number of anatomical portions in a slice using spatial + biological features.
 
     Returns
     -------
-    ndarray, shape (ns, nt), values in [0.0, 1.0]
-        M_spatial[i, j] = 0  → source cell i and target cell j coincide
-        M_spatial[i, j] = 1  → maximally distant pair in the data
+    labels : (n_cells,) hard portion labels
+    probs : (n_cells, k) soft membership probabilities
+    k : int selected number of portions
     """
-    from sklearn.neighbors import NearestNeighbors
-    from sklearn.metrics.pairwise import euclidean_distances as _euc
+    n = curr_slice.shape[0]
+    if n == 0:
+        raise ValueError("Cannot discover portions on an empty slice.")
 
-    src = coords_A.astype(np.float64).copy()
-    tgt = coords_B.astype(np.float64)
+    if n < max(2 * min_portion_size, 30):
+        labels = np.zeros(n, dtype=np.int64)
+        probs = np.ones((n, 1), dtype=np.float64)
+        return labels, probs, 1
 
-    # ── Translation-only ICP ───────────────────────────────────────────────
-    # Iteratively shift src centroid toward the closest cluster of tgt cells.
-    # Converges when the required translation is < 1e-6 (sub-pixel precision).
-    nbrs = NearestNeighbors(n_neighbors=1, algorithm='kd_tree')
-    for _ in range(n_icp_iter):
-        nbrs.fit(tgt)
-        _, idx = nbrs.kneighbors(src)
-        matched = tgt[idx.flatten()]
-        t = matched.mean(axis=0) - src.mean(axis=0)
-        src = src + t
-        if np.linalg.norm(t) < 1e-6:
-            break
+    coords = np.asarray(curr_slice.obsm['spatial'], dtype=np.float64)
+    if coords.ndim != 2 or coords.shape[1] < 2:
+        raise ValueError("Expected curr_slice.obsm['spatial'] to be an (n,2+) array.")
 
-    # ── Pairwise Euclidean distances (aligned source vs original target) ───
-    D     = _euc(src, tgt)
-    d_max = float(D.max())
-    if d_max > 1e-12:
-        D = D / d_max
-    return D.astype(np.float64)
+    expr = _dense_expr_matrix(curr_slice, use_rep)
+    expr = np.log1p(np.maximum(expr, 0.0))
+    expr = expr - expr.mean(axis=0, keepdims=True)
+    expr_std = expr.std(axis=0, keepdims=True)
+    expr_std = np.where(expr_std < 1e-8, 1.0, expr_std)
+    expr = expr / expr_std
 
+    labels = np.asarray(curr_slice.obs['cell_type_annot'].astype(str).values)
+    uniq_types = np.array(sorted(pd.Index(labels).unique()), dtype=object)
+    onehot = _celltype_one_hot(labels, uniq_types)
 
-# ── Overlap-fraction estimation helper ─────────────────────────────────────
-def _estimate_overlap_fraction(
-    M_lin: np.ndarray,
-    ns: int,
-    nt: int,
-    logFile=None,
-) -> float:
-    """
-    Estimate the spatial overlap fraction m ∈ (0, 1] between two sections
-    WITHOUT requiring any prior knowledge of the acquisition geometry.
+    # Weighted concatenation. Spatial drives topology; bio features disambiguate adjacent regions.
+    feat = np.concatenate([
+        coords / (coords.std(axis=0, keepdims=True) + 1e-8),
+        0.75 * onehot,
+        0.20 * expr,
+    ], axis=1)
 
-    Biological rationale
-    --------------------
-    Cells that lie in the overlapping region have at least one geometrically
-    and molecularly compatible partner in the other section, so the cost of
-    their best possible match (min row/column in the linear cost matrix) is
-    low.  Cells in the NON-overlapping region have NO compatible partner; all
-    their pairwise costs are high, so their best-match cost is also high.
+    k_upper = int(max(1, min(max_portions, n // max(1, min_portion_size))))
+    if k_upper <= 1:
+        labels = np.zeros(n, dtype=np.int64)
+        probs = np.ones((n, 1), dtype=np.float64)
+        return labels, probs, 1
 
-    This creates a bimodal distribution of per-cell best-match costs:
-        • Low mode  → overlapping cells
-        • High mode → non-overlapping cells
+    best = None
+    best_score = np.inf
 
-    A 1-D Gaussian Mixture Model (k=2) separates the two populations.
-    The weight of the low-cost component is the estimated overlap fraction
-    for that side.  The final m is the minimum across both sides (the
-    bottleneck is the side with less overlap).
-
-    Parameters
-    ----------
-    M_lin : (ns, nt) ndarray
-        Combined normalised linear cost matrix (M1 + M2 contributions).
-    ns, nt : int
-        Number of source and target cells.
-    logFile : file-like, optional
-        If provided, log messages are written here.
-
-    Returns
-    -------
-    float  in (0.05, 1.0]
-    """
-    from sklearn.mixture import GaussianMixture
-
-    def _gmm_overlap_1d(costs: np.ndarray) -> float:
-        """Fraction of cells in the low-cost (overlapping) GMM component."""
-        c = costs.reshape(-1, 1).astype(np.float64)
-        c_min, c_max = c.min(), c.max()
-        if c_max - c_min < 1e-10:
-            return 1.0  # all equal → perfectly overlapping
-        c_norm = (c - c_min) / (c_max - c_min)  # scale to [0,1] for stability
+    for k in range(1, k_upper + 1):
         try:
-            gm = GaussianMixture(
-                n_components=2,
+            gmm = GaussianMixture(
+                n_components=k,
                 covariance_type='full',
-                n_init=15,
-                random_state=0,
-            ).fit(c_norm)
-            low_idx = int(np.argmin(gm.means_.flatten()))
-            return float(gm.weights_[low_idx])
+                reg_covar=1e-5,
+                random_state=random_state,
+                n_init=3,
+                max_iter=300,
+            )
+            gmm.fit(feat)
+            pred = gmm.predict(feat)
+            counts = np.bincount(pred, minlength=k)
+
+            # Reject pathological tiny components that often represent noise slivers.
+            if k > 1 and np.any(counts < min_portion_size):
+                continue
+
+            bic = gmm.bic(feat)
+            # Light complexity penalty to avoid over-segmentation in noisy slices.
+            score = bic + 3.0 * k * np.log(n + 1.0)
+            if score < best_score:
+                best_score = score
+                best = gmm
         except Exception:
-            # Robust fallback: fraction below the median
-            return float((c_norm < 0.5).mean())
+            continue
 
-    best_src = M_lin.min(axis=1)   # (ns,) — best cost for each source cell
-    best_tgt = M_lin.min(axis=0)   # (nt,) — best cost for each target cell
+    if best is None:
+        labels = np.zeros(n, dtype=np.int64)
+        probs = np.ones((n, 1), dtype=np.float64)
+        return labels, probs, 1
 
-    m_src = _gmm_overlap_1d(best_src)
-    m_tgt = _gmm_overlap_1d(best_tgt)
-
-    # Conservative: overlap is bounded by the side with fewer matching cells
-    m = float(np.clip(min(m_src, m_tgt), 0.05, 1.0))
-
-    msg = (
-        f"[overlap_estimate] GMM fractions — src={m_src:.3f}, tgt={m_tgt:.3f} "
-        f"→ m={m:.3f} "
-        f"(src non-overlap: {(1-m_src)*100:.1f}%, tgt non-overlap: {(1-m_tgt)*100:.1f}%)"
-    )
-    print(msg)
-    if logFile is not None:
-        logFile.write(msg + "\n")
-
-    return m
+    probs = best.predict_proba(feat).astype(np.float64)
+    labels = probs.argmax(axis=1).astype(np.int64)
+    return labels, probs, int(probs.shape[1])
 
 
-# ── Hemisphere pre-selection helper ───────────────────────────────────────────
-def _icp_hemisphere_select(
+def _portion_celltype_profiles(
+    labels: np.ndarray,
+    probs: np.ndarray,
+    celltypes: np.ndarray,
+    global_types: np.ndarray,
+) -> np.ndarray:
+    """Compute soft cell-type profiles per discovered portion."""
+    onehot = _celltype_one_hot(celltypes, global_types)
+    profiles = probs.T @ onehot
+    profiles = _safe_normalize_rows(profiles)
+    return profiles
+
+
+def _jsd_rows(P: np.ndarray, Q: np.ndarray, eps: float = 1e-12) -> np.ndarray:
+    """Pairwise Jensen-Shannon distance between row distributions of P and Q."""
+    P = np.asarray(P, dtype=np.float64)
+    Q = np.asarray(Q, dtype=np.float64)
+    P = _safe_normalize_rows(P + eps)
+    Q = _safe_normalize_rows(Q + eps)
+
+    out = np.zeros((P.shape[0], Q.shape[0]), dtype=np.float64)
+    for i in range(P.shape[0]):
+        p = P[i][None, :]
+        m = 0.5 * (p + Q)
+        kl_pm = np.sum(p * (np.log(p + eps) - np.log(m + eps)), axis=1)
+        kl_qm = np.sum(Q * (np.log(Q + eps) - np.log(m + eps)), axis=1)
+        out[i, :] = np.sqrt(np.maximum(0.5 * (kl_pm + kl_qm), 0.0))
+    return out
+
+
+def _portion_constraint_penalty(
     sliceA: AnnData,
     sliceB: AnnData,
-    allow_reflection: bool = False,
-    logFile=None,
-) -> AnnData:
+    use_rep: Optional[str],
+    max_portions: int,
+    min_portion_size: int,
+    random_state: int,
+    relation_threshold: float,
+) -> Tuple[np.ndarray, dict]:
     """
-    Detect the left / right hemispheres in sliceB (target) by k-means on the
-    mediolateral (x) coordinate, then pick the hemisphere whose spatial point
-    cloud best matches sliceA via translation-only ICP.
+    Build an organ-agnostic, soft portion-compatibility penalty matrix (nA x nB).
 
-    Translation-only ICP is used (no reflection allowed by default) because
-    both hemispheres are mirror images: allowing reflection would remove the
-    spatial signal that distinguishes them.  If ``allow_reflection=True`` the
-    x-reflected variant of sliceA is also tried (in case the source section
-    was acquired in the opposite orientation).
-
-    Returns
-    -------
-    AnnData
-        Subset of sliceB corresponding to the best-matching hemisphere.
+    Lower penalty means higher compatibility. Supports asymmetric and partial overlap.
     """
-    from sklearn.cluster import KMeans
-    from sklearn.neighbors import NearestNeighbors
+    labsA = np.asarray(sliceA.obs['cell_type_annot'].astype(str).values)
+    labsB = np.asarray(sliceB.obs['cell_type_annot'].astype(str).values)
+    global_types = np.array(sorted(pd.Index(labsA).union(pd.Index(labsB))), dtype=object)
 
-    coords_A = sliceA.obsm['spatial'].astype(np.float64)
-    coords_B = sliceB.obsm['spatial'].astype(np.float64)
-
-    # ── Step 1: split target into left / right by x-coordinate ──────────
-    km = KMeans(n_clusters=2, n_init=20, random_state=0).fit(coords_B[:, 0:1])
-    labels = km.labels_.copy()
-    # Ensure label 0 = left (lower mean x)
-    if coords_B[labels == 0, 0].mean() > coords_B[labels == 1, 0].mean():
-        labels = 1 - labels
-    left_mask  = (labels == 0)
-    right_mask = (labels == 1)
-
-    n_left  = int(left_mask.sum())
-    n_right = int(right_mask.sum())
-
-    # ── Step 2: translation-only ICP residual ───────────────────────────
-    def _icp_residual(src: np.ndarray, tgt: np.ndarray,
-                      max_iter: int = 60, tol: float = 1e-6) -> float:
-        """Return mean NN distance after translation-only ICP alignment."""
-        src = src.copy()
-        nbrs_fit = NearestNeighbors(n_neighbors=1, algorithm='kd_tree')
-        for _ in range(max_iter):
-            nbrs_fit.fit(tgt)
-            dists, idx = nbrs_fit.kneighbors(src)
-            matched = tgt[idx.flatten()]
-            t = matched.mean(axis=0) - src.mean(axis=0)
-            src += t
-            if np.linalg.norm(t) < tol:
-                break
-        nbrs_fit.fit(tgt)
-        final_dists, _ = nbrs_fit.kneighbors(src)
-        return float(final_dists.mean())
-
-    # Build candidate list: (residual, mask, description)
-    candidates = [
-        (_icp_residual(coords_A, coords_B[left_mask]),  left_mask,  'left'),
-        (_icp_residual(coords_A, coords_B[right_mask]), right_mask, 'right'),
-    ]
-    if allow_reflection:
-        coords_A_ref = coords_A.copy()
-        coords_A_ref[:, 0] = -coords_A_ref[:, 0]   # reflect along mediolateral axis
-        candidates += [
-            (_icp_residual(coords_A_ref, coords_B[left_mask]),  left_mask,  'left (x-reflected)'),
-            (_icp_residual(coords_A_ref, coords_B[right_mask]), right_mask, 'right (x-reflected)'),
-        ]
-
-    # ── Step 3: pick the winner ──────────────────────────────────────────
-    best_res, best_mask, best_side = min(candidates, key=lambda c: c[0])
-
-    res_summary = ', '.join(f"{desc}={res:.3f}" for res, _, desc in candidates)
-    msg = (
-        f"[hemisphere_select] ICP residuals: {res_summary}\n"
-        f"[hemisphere_select] Selected '{best_side}' "
-        f"(n={int(best_mask.sum())} cells, "
-        f"left={n_left}, right={n_right})"
+    _, probsA, kA = _discover_portions(
+        curr_slice=sliceA,
+        use_rep=use_rep,
+        max_portions=max_portions,
+        min_portion_size=min_portion_size,
+        random_state=random_state,
     )
-    print(msg)
-    if logFile is not None:
-        logFile.write(msg + "\n")
+    _, probsB, kB = _discover_portions(
+        curr_slice=sliceB,
+        use_rep=use_rep,
+        max_portions=max_portions,
+        min_portion_size=min_portion_size,
+        random_state=random_state + 17,
+    )
 
-    return sliceB[best_mask]
+    if kA == 1 and kB == 1:
+        penalty = np.zeros((sliceA.shape[0], sliceB.shape[0]), dtype=np.float64)
+        meta = {
+            'kA': 1,
+            'kB': 1,
+            'portion_transport': np.array([[1.0]], dtype=np.float64),
+            'portion_cost': np.array([[0.0]], dtype=np.float64),
+            'allowed_mask': np.array([[1.0]], dtype=np.float64),
+        }
+        return penalty, meta
+
+    profA = _portion_celltype_profiles(np.argmax(probsA, axis=1), probsA, labsA, global_types)
+    profB = _portion_celltype_profiles(np.argmax(probsB, axis=1), probsB, labsB, global_types)
+    portion_cost = _jsd_rows(profA, profB)
+
+    massA = probsA.sum(axis=0).astype(np.float64)
+    massB = probsB.sum(axis=0).astype(np.float64)
+    massA = massA / np.maximum(massA.sum(), 1e-12)
+    massB = massB / np.maximum(massB.sum(), 1e-12)
+
+    # Portion-level OT permits asymmetric overlap via transport plan on discovered portions.
+    T = ot.emd(massA, massB, portion_cost)
+    T = np.asarray(T, dtype=np.float64)
+    if T.sum() > 0:
+        T = T / T.sum()
+
+    # Allowed portion-pairs are those that carry enough mass in the portion-level transport.
+    tau = relation_threshold * max(float(T.max()), 1e-12)
+    allowed = (T >= tau).astype(np.float64)
+    if allowed.sum() == 0:
+        allowed[np.unravel_index(np.argmax(T), T.shape)] = 1.0
+
+    # Soft pairwise compatibility from soft memberships through allowed portion correspondences.
+    allowed_prob = probsA @ allowed @ probsB.T
+    penalty = 1.0 - np.clip(allowed_prob, 0.0, 1.0)
+
+    meta = {
+        'kA': int(kA),
+        'kB': int(kB),
+        'portion_transport': T,
+        'portion_cost': portion_cost,
+        'allowed_mask': allowed,
+    }
+    return penalty, meta
 
 
 def pairwise_align(
@@ -289,12 +269,14 @@ def pairwise_align(
     sliceB_name: Optional[str] = None,
     overwrite = False,
     neighborhood_dissimilarity: str='jsd',
-    dummy_cell: bool = False,
-    select_hemisphere: bool = False,
-    allow_reflection: bool = False,
-    overlap_fraction: Optional[float] = None,
-    auto_overlap: bool = True,
-    spatial_weight: float = 0.0,
+    dummy_cell: bool = True,
+    portion_mode: str = 'off',
+    portion_penalty_weight: float = 2.0,
+    portion_hard_mask: bool = False,
+    max_portions: int = 8,
+    min_portion_size: int = 40,
+    portion_relation_threshold: float = 0.05,
+    random_state: int = 0,
     **kwargs) -> Union[NDArray[np.floating], Tuple[NDArray[np.floating], float, float, float, float]]:
     """
 
@@ -309,6 +291,15 @@ def pairwise_align(
         gamma: weight for gene expression distance (JSD)
         beta: weight for cell type one hot encoding
         radius: radius for cellular neighborhood
+        portion_mode: ``'off'`` or ``'auto'``. In auto mode, discovers an unknown number of portions
+                  in each slice and constrains transport to compatible portions.
+        portion_penalty_weight: Weight of soft portion incompatibility penalty (used when portion_mode='auto').
+        portion_hard_mask: If ``True``, imposes near-hard blocking of incompatible portion pairs.
+        max_portions: Upper bound for automatically discovered portions per slice.
+        min_portion_size: Minimum cell count per discovered portion.
+        portion_relation_threshold: Threshold for considering a portion pair compatible relative to
+                       max portion-level transport mass.
+        random_state: Random seed used in automatic portion discovery.
 
         dissimilarity: Expression dissimilarity measure: ``'kl'`` or ``'euclidean'``.
         use_rep: If ``None``, uses ``slice.X`` to calculate dissimilarity between spots, otherwise uses the representation given by ``slice.obsm[use_rep]``.
@@ -322,48 +313,6 @@ def pairwise_align(
         return_obj: If ``True``, additionally returns objective function output of FGW-OT.
         verbose: If ``True``, FGW-OT is verbose.
         gpu_verbose: If ``True``, print whether gpu is being used to user.
-        select_hemisphere: If ``True``, automatically detect left/right hemispheres in
-            sliceB by k-means on the mediolateral (x) coordinate and select the
-            hemisphere whose spatial point cloud best matches sliceA via
-            translation-only ICP.  Solves the bilateral-symmetry problem when the
-            source is one hemisphere and the target is a full coronal section.
-        allow_reflection: Used only when ``select_hemisphere=True``.  If ``True``,
-            also tries the x-reflected source as a candidate (handles acquisitions
-            where the source section was scanned in the opposite orientation).
-        overlap_fraction: Fraction of mass to transport, 0 < m ≤ 1.  Controls the
-            Partial FGW formulation (Chapel et al., NeurIPS 2020).  Setting m < 1
-            means (1-m) of the cells on each side are allowed to remain unmatched
-            (sent to a dummy node).  This handles ALL partial-overlap scenarios:
-            both-full, both-half, half+full, arbitrary unknown overlap.  When set
-            to 1.0 the problem reduces to fully-balanced FGW.  When ``None``
-            (default), the choice falls back to the legacy ``dummy_cell`` budget
-            approach unless ``auto_overlap=True``.
-        auto_overlap: If ``True`` and ``overlap_fraction`` is ``None``, automatically
-            estimate the overlap fraction from the linear cost matrix before running
-            FGW.  Uses a 1-D Gaussian Mixture Model on per-cell best-match costs
-            (see ``_estimate_overlap_fraction``).  Recommended for all real
-            experiments.  Overrides ``dummy_cell`` if the estimate is < 1.0.
-        spatial_weight: Weight δ ∈ [0, 1) for the absolute-coordinates proximity
-            term added into the linear cost M.  When > 0 the effective cost becomes:
-
-                M_eff = (1 - δ) * M_molecular + δ * M_spatial
-
-            where M_spatial is a normalised pairwise Euclidean distance matrix
-            computed from the ABSOLUTE spatial coordinates of the cells after a
-            translation-only ICP pre-alignment (see ``_spatial_prior_cost``).
-
-            This is the **only signal that can break bilateral symmetry** in the
-            mouse brain: gene expression and cellular neighbourhoods are symmetric,
-            but absolute atlas positions are not.  A value of 0.3–0.5 is generally
-            sufficient to prevent hemisphere mixing while still letting molecular
-            signals dominate.
-
-            Generalises to all scenarios:
-              • both-full / same region:     M_spatial ≈ uniform → no harm
-              • half+full (bilateral target): strongly penalises wrong hemisphere
-              • arbitrary partial overlap:    steers OT toward the geometrically
-                                              overlapping sub-region
-            Default: 0.0 (disabled, backward-compatible).
    
     Returns:
         - Alignment of spots.
@@ -393,13 +342,9 @@ def pairwise_align(
     logFile.write(f"beta: {beta}\n")
     logFile.write(f"gamma: {gamma}\n")
     logFile.write(f"radius: {radius}\n")
-    
-    # pre‑declare the three possible neighbourhood distance arrays so that
-    # static analysers know the names exist; actual values are filled in
-    # in the block handling `neighborhood_dissimilarity`.
-    js_dist_neighborhood = None
-    msd_neighborhood = None
-    cosine_dist_neighborhood = None
+    logFile.write(f"portion_mode: {portion_mode}\n")
+    logFile.write(f"portion_penalty_weight: {portion_penalty_weight}\n")
+    logFile.write(f"portion_hard_mask: {portion_hard_mask}\n")
 
 
     
@@ -429,23 +374,26 @@ def pairwise_align(
         if not len(s):
             raise ValueError(f"Found empty `AnnData`:\n{s}.")
 
-    # ── Hemisphere pre-selection ───────────────────────────────────────────────
-    # When sliceB is a full bilateral section (two hemispheres) and sliceA is
-    # one hemisphere, FGW mixes L/R because both hemispheres have the same
-    # pairwise distance structure (bilateral symmetry).  The only signal that
-    # can distinguish them is absolute spatial geometry, detected here via ICP.
-    if select_hemisphere:
-        logFile.write("[hemisphere_select] Running ICP hemisphere pre-selection\n")
-        logFile.write(f"[hemisphere_select] sliceB before selection: {sliceB.shape[0]} cells\n")
-        sliceB = _icp_hemisphere_select(
-            sliceA, sliceB,
-            allow_reflection=allow_reflection,
-            logFile=logFile,
-        )
-        logFile.write(f"[hemisphere_select] sliceB after selection: {sliceB.shape[0]} cells\n")
-
+    
     # Backend
-    nx = backend    
+    nx = backend
+
+    # Filter to shared genes
+    shared_genes = sliceA.var_names.intersection(sliceB.var_names)
+    if len(shared_genes) == 0:
+        raise ValueError("No shared genes between the two slices.")
+    sliceA = sliceA[:, shared_genes]
+    sliceB = sliceB[:, shared_genes]
+
+
+    # Filter to shared cell types
+    # This is needed for the cell-type mismatch penalty, and also ensures that the neighborhood distributions are comparable (same set of cell types).
+    shared_cell_types = pd.Index(sliceA.obs['cell_type_annot']).unique().intersection(pd.Index(sliceB.obs['cell_type_annot']).unique())
+    if len(shared_cell_types) == 0:
+        raise ValueError("No shared cell types between the two slices.")
+    sliceA = sliceA[sliceA.obs['cell_type_annot'].isin(shared_cell_types)]
+    sliceB = sliceB[sliceB.obs['cell_type_annot'].isin(shared_cell_types)]
+
     
     # Calculate spatial distances
     coordinatesA = sliceA.obsm['spatial'].copy()
@@ -470,7 +418,7 @@ def pairwise_align(
 
     # Calculate gene expression dissimilarity
     # filePath = '/content/drive/MyDrive/Thesis_data_anup/local_data'
-    cosine_dist_gene_expr = cosine_distance(sliceA, sliceB, sliceA_name, sliceB_name, filePath, use_rep = use_rep, use_gpu = use_gpu, nx = nx, overwrite=overwrite)
+    cosine_dist_gene_expr = cosine_distance(sliceA, sliceB, sliceA_name, sliceB_name, filePath, use_rep = use_rep, use_gpu = use_gpu, nx = nx, beta = beta, overwrite=overwrite)
 
     # ── Explicit cell-type mismatch penalty ──────────────────────────────
     # Binary matrix: 0 for same type, 1 for different type.
@@ -479,30 +427,44 @@ def pairwise_align(
     _lab_A = np.asarray(sliceA.obs['cell_type_annot'].values)
     _lab_B = np.asarray(sliceB.obs['cell_type_annot'].values)
     M_celltype = (_lab_A[:, None] != _lab_B[None, :]).astype(np.float64)
-    M1_combined = (1-beta) * cosine_dist_gene_expr + beta * M_celltype
+    M1_combined = (1 - beta) * cosine_dist_gene_expr + beta * M_celltype
     logFile.write(f"[cell_type_penalty] beta={beta}, M_celltype shape={M_celltype.shape}\n")
 
-    # ── Spatial proximity prior ─────────────────────────────────────────────
-    # Inject an absolute-coordinate distance term into the linear cost.
-    # This is the *only* signal that can break bilateral symmetry because
-    # gene expression and cellular neighbourhoods are bilaterally symmetric.
-    # The ICP pre-alignment inside _spatial_prior_cost removes any acquisition
-    # translation offset before computing distances, so this works even when
-    # the two sections were imaged in different coordinate frames.
-    if spatial_weight > 0.0:
-        _sw = float(np.clip(spatial_weight, 0.0, 1.0))
-        _coords_A_raw = sliceA.obsm['spatial'].astype(np.float64)
-        _coords_B_raw = sliceB.obsm['spatial'].astype(np.float64)
-        _M_spatial    = _spatial_prior_cost(_coords_A_raw, _coords_B_raw, n_icp_iter=60)
-        M1_combined   = (1.0 - _sw) * M1_combined + _sw * _M_spatial
-        _sp_msg = (
-            f"[spatial_prior] spatial_weight={_sw:.3f}, "
-            f"M_spatial shape={_M_spatial.shape}, "
-            f"min={_M_spatial.min():.4f}, max={_M_spatial.max():.4f}, "
-            f"mean={_M_spatial.mean():.4f}"
+    # ── Organ-agnostic portion-aware constraint ─────────────────────────
+    # Auto-discovers unknown number of portions and discourages transport
+    # across incompatible portions. This supports asymmetric and partial overlap.
+    if portion_mode not in {'off', 'auto'}:
+        raise ValueError(f"Invalid portion_mode {portion_mode!r}. Expected one of {'off','auto'}.")
+
+    if portion_mode == 'auto':
+        portion_penalty, portion_meta = _portion_constraint_penalty(
+            sliceA=sliceA,
+            sliceB=sliceB,
+            use_rep=use_rep,
+            max_portions=max_portions,
+            min_portion_size=min_portion_size,
+            random_state=random_state,
+            relation_threshold=portion_relation_threshold,
         )
-        print(_sp_msg)
-        logFile.write(_sp_msg + "\n")
+
+        M1_combined = M1_combined + portion_penalty_weight * portion_penalty
+
+        if portion_hard_mask:
+            # Apply strong additive barrier where compatibility is near zero.
+            hard_mask = portion_penalty > 0.999
+            barrier = 10.0 * max(float(np.max(M1_combined)), 1.0)
+            M1_combined = M1_combined + hard_mask.astype(np.float64) * barrier
+
+        logFile.write(
+            f"[portion_constraint] kA={portion_meta['kA']}, kB={portion_meta['kB']}, "
+            f"penalty_mean={float(np.mean(portion_penalty)):.6f}, "
+            f"penalty_max={float(np.max(portion_penalty)):.6f}\n"
+        )
+        print(
+            f"[portion_constraint] auto mode enabled: kA={portion_meta['kA']}, "
+            f"kB={portion_meta['kB']}, penalty_mean={float(np.mean(portion_penalty)):.6f}"
+        )
+
 
     M1 = nx.from_numpy(M1_combined)
 
@@ -605,161 +567,66 @@ def pairwise_align(
             f"got {neighborhood_dissimilarity!r}."
         )
 
-    # ── Partial FGW / Dummy-cell augmentation ─────────────────────────────
-    #
-    # TWO paths — controlled by ``overlap_fraction`` / ``auto_overlap``:
-    #
-    #  PATH A — Partial Fused Gromov-Wasserstein  (Chapel et al., NeurIPS 2020)
-    #  ─────────────────────────────────────────────────────────────────────────
-    #  Handles ALL partial-overlap scenarios without any prior knowledge of the
-    #  acquisition geometry (both-full, both-half, half+full, arbitrary).
-    #
-    #  The overlap fraction  m ∈ (0,1]  controls how much mass is transported:
-    #    • Real weights: m/ns  for source,  m/nt  for target  (sum to m each)
-    #    • Dummy weight: 1-m   for both sides (absorbs unmatched mass)
-    #    • Dummy LINEAR cost:  τ = max_cost / 2   (proven optimal by Chapel et al.)
-    #    • Dummy SPATIAL cost: 0  (keeps dummy invisible to the GW term)
-    #
-    #  Activated when  ``overlap_fraction`` is set explicitly OR when
-    #  ``auto_overlap=True`` (then m is estimated from the linear cost matrix
-    #  via a 1-D Gaussian Mixture Model on per-cell best-match costs).
-    #
-    #  PATH B — Legacy budget-based dummy cell  (backward-compatible default)
-    #  ─────────────────────────────────────────────────────────────────────────
-    #  Only handles SIZE IMBALANCE (per cell-type count deltas).  Used when
-    #  ``overlap_fraction is None`` and ``auto_overlap=False`` and
-    #  ``dummy_cell=True``.
+    # ── Dummy cell augmentation ────────────────────────────────────────────
+    # Only add a dummy on the side that actually has a deficit.
+    # _has_dummy_src: True if source has fewer cells → need dummy source (birth)
+    # _has_dummy_tgt: True if target has fewer cells → need dummy target (death)
+    _has_dummy_src = False
+    _has_dummy_tgt = False
 
-    def _to_np(x):
-        """Convert any backend tensor to float64 numpy."""
-        try:
-            return x.cpu().detach().numpy().astype(np.float64)
-        except Exception:
-            return np.array(x, dtype=np.float64)
-
-    ns = sliceA.shape[0]
-    nt = sliceB.shape[0]
-
-    # State flags — set by whichever path runs below.
-    _has_dummy_src = False   # legacy path only
-    _has_dummy_tgt = False   # legacy path only
-    _budget        = 0       # legacy path only
-    _w_dummy_src   = 0       # legacy path only
-    _w_dummy_tgt   = 0       # legacy path only
-    _has_partial   = False   # True when partial FGW path is active
-    _partial_m     = 1.0
-    _ns_aug        = ns      # augmented sizes (updated below)
-    _nt_aug        = nt
-
-    # ── Resolve effective overlap fraction ────────────────────────────────
-    _eff_overlap = overlap_fraction  # may be None
-    if _eff_overlap is None and auto_overlap:
-        M1_np_est = _to_np(M1)
-        M2_np_est = _to_np(M2)
-        M_lin_est = alpha * M1_np_est + gamma * M2_np_est
-        # Normalise to [0,1] so GMM is scale-independent
-        _lin_max = M_lin_est.max()
-        if _lin_max > 1e-12:
-            M_lin_est = M_lin_est / _lin_max
-        _eff_overlap = _estimate_overlap_fraction(
-            M_lin_est[:ns, :nt], ns, nt, logFile=logFile
-        )
-        logFile.write(f"[auto_overlap] estimated overlap_fraction m={_eff_overlap:.4f}\n")
-
-    # ── PATH A: Partial FGW ───────────────────────────────────────────────
-    if _eff_overlap is not None and float(_eff_overlap) < 1.0:
-        _has_partial = True
-        _partial_m   = float(np.clip(_eff_overlap, 0.05, 1.0))
-        m            = _partial_m
-        _ns_aug      = ns + 1
-        _nt_aug      = nt + 1
-
-        logFile.write(f"[partial_fgw] overlap_fraction m={m:.4f}\n")
-        print(f"[partial_fgw] Partial FGW  m={m:.4f}  "
-              f"(unmatched: src {(1-m)*100:.1f}%,  tgt {(1-m)*100:.1f}%)")
-
-        M1_np = _to_np(M1)
-        M2_np = _to_np(M2)
-
-        # Theoretically optimal threshold: τ = max_cost / 2  (Chapel et al. 2020)
-        # Applied independently to M1 and M2 so each contributes proportionally.
-        tau_M1 = float(M1_np.max()) / 2.0
-        tau_M2 = float(M2_np.max()) / 2.0
-        logFile.write(f"[partial_fgw] τ_M1={tau_M1:.4f}, τ_M2={tau_M2:.4f}\n")
-
-        # ── Augment M1 (all dummy entries = τ_M1; dummy-to-dummy = 0) ──
-        M1_aug = np.full((_ns_aug, _nt_aug), tau_M1, dtype=np.float64)
-        M1_aug[:ns, :nt] = M1_np
-        M1_aug[ns,  nt]  = 0.0   # dummy-to-dummy is free
-        M1 = nx.from_numpy(M1_aug)
-
-        # ── Augment M2 ──
-        M2_aug = np.full((_ns_aug, _nt_aug), tau_M2, dtype=np.float64)
-        M2_aug[:ns, :nt] = M2_np
-        M2_aug[ns,  nt]  = 0.0
-        M2 = nx.from_numpy(M2_aug)
-
-        # ── Augment D_A: dummy row/col = 0 (invisible to GW term) ──
-        D_A_np  = _to_np(D_A)
-        D_A_aug = np.zeros((_ns_aug, _ns_aug), dtype=np.float64)
-        D_A_aug[:ns, :ns] = D_A_np
-        D_A = nx.from_numpy(D_A_aug)
-        if isinstance(nx, ot.backend.TorchBackend):
-            D_A = D_A.float()
-
-        # ── Augment D_B ──
-        D_B_np  = _to_np(D_B)
-        D_B_aug = np.zeros((_nt_aug, _nt_aug), dtype=np.float64)
-        D_B_aug[:nt, :nt] = D_B_np
-        D_B = nx.from_numpy(D_B_aug)
-        if isinstance(nx, ot.backend.TorchBackend):
-            D_B = D_B.float()
-
-        logFile.write(
-            f"[partial_fgw] Augmented: D_A {D_A_aug.shape}, D_B {D_B_aug.shape}, "
-            f"M1 {M1_aug.shape}, M2 {M2_aug.shape}\n"
-        )
-
-    # ── PATH B: Legacy budget-based dummy cell ────────────────────────────
-    elif dummy_cell:
+    if dummy_cell:
         from collections import Counter
+        ns, nt = sliceA.shape[0], sliceB.shape[0]
         labels_A = sliceA.obs['cell_type_annot'].values
         labels_B = sliceB.obs['cell_type_annot'].values
         counts_A = Counter(labels_A)
         counts_B = Counter(labels_B)
         all_types = set(counts_A.keys()) | set(counts_B.keys())
-        _budget      = sum(max(counts_A.get(k, 0), counts_B.get(k, 0)) for k in all_types)
+        _budget = sum(max(counts_A.get(k, 0), counts_B.get(k, 0)) for k in all_types)
         _w_dummy_src = _budget - ns   # extra weight for dummy source cell (birth)
         _w_dummy_tgt = _budget - nt   # extra weight for dummy target cell (death)
         _has_dummy_src = _w_dummy_src > 0
         _has_dummy_tgt = _w_dummy_tgt > 0
-        _ns_aug = ns + (1 if _has_dummy_src else 0)
-        _nt_aug = nt + (1 if _has_dummy_tgt else 0)
 
         logFile.write(f"[dummy_cell] budget={_budget}, w_dummy_src={_w_dummy_src}, w_dummy_tgt={_w_dummy_tgt}\n")
         print(f"[dummy_cell] budget={_budget}, "
               f"dummy_src={'YES (birth)' if _has_dummy_src else 'NO'} w={_w_dummy_src}, "
               f"dummy_tgt={'YES (death)' if _has_dummy_tgt else 'NO'} w={_w_dummy_tgt}")
 
+        def _to_np(x):
+            """Convert backend tensor to float64 numpy."""
+            try:
+                return x.cpu().detach().numpy().astype(np.float64)
+            except Exception:
+                return np.array(x, dtype=np.float64)
+
+        _ns_aug = ns + (1 if _has_dummy_src else 0)
+        _nt_aug = nt + (1 if _has_dummy_tgt else 0)
+
         # ---- Augment D_A if dummy source needed ----
+        # Dummy spatial distance = 0: makes dummy INVISIBLE to the Gromov term.
+        # Since C1[dummy, k] = 0 for all k, the gradient df(G) for real cells
+        # is identical to the non-dummy case → spatial alignment preserved.
         if _has_dummy_src:
-            D_A_np  = _to_np(D_A)
+            D_A_np = _to_np(D_A)
             D_A_aug = np.zeros((_ns_aug, _ns_aug), dtype=np.float64)
             D_A_aug[:ns, :ns] = D_A_np
+            # D_A_aug[ns, :] and D_A_aug[:, ns] stay 0
             D_A = nx.from_numpy(D_A_aug)
             if isinstance(nx, ot.backend.TorchBackend):
                 D_A = D_A.float()
 
         # ---- Augment D_B if dummy target needed ----
         if _has_dummy_tgt:
-            D_B_np  = _to_np(D_B)
+            D_B_np = _to_np(D_B)
             D_B_aug = np.zeros((_nt_aug, _nt_aug), dtype=np.float64)
             D_B_aug[:nt, :nt] = D_B_np
+            # D_B_aug[nt, :] and D_B_aug[:, nt] stay 0
             D_B = nx.from_numpy(D_B_aug)
             if isinstance(nx, ot.backend.TorchBackend):
                 D_B = D_B.float()
 
-        # ---- Per-type max costs for dummy entries ----
+        # ---- Precompute per-type max cost from the same-type submatrix ----
         M1_np = _to_np(M1)
         M2_np = _to_np(M2)
         _type_M1_max = {}
@@ -771,87 +638,82 @@ def pairwise_align(
                 _type_M1_max[_type_k] = float(M1_np[np.ix_(_S, _T)].max())
                 _type_M2_max[_type_k] = float(M2_np[np.ix_(_S, _T)].max())
             else:
+                # Type absent on one side — fall back to global max
                 _type_M1_max[_type_k] = float(M1_np.max())
                 _type_M2_max[_type_k] = float(M2_np.max())
 
+        # Per-cell dummy costs: each cell pays the max of its own type's submatrix
         _death_M1 = np.array([_type_M1_max[_lab_A[i]] for i in range(ns)], dtype=np.float64)
         _birth_M1 = np.array([_type_M1_max[_lab_B[j]] for j in range(nt)], dtype=np.float64)
         _death_M2 = np.array([_type_M2_max[_lab_A[i]] for i in range(ns)], dtype=np.float64)
         _birth_M2 = np.array([_type_M2_max[_lab_B[j]] for j in range(nt)], dtype=np.float64)
+
         epsilon = 1e-6
 
+        # ---- Augment M1: add dummy row/col only where needed ----
         M1_aug = np.zeros((_ns_aug, _nt_aug), dtype=np.float64)
         M1_aug[:ns, :nt] = M1_np
         if _has_dummy_tgt:
-            M1_aug[:ns, nt] = _death_M1 + epsilon
+            M1_aug[:ns, nt] = _death_M1 + epsilon   # src cell i → dummy tgt: max within i's type
         if _has_dummy_src:
-            M1_aug[ns, :nt] = _birth_M1 + epsilon
+            M1_aug[ns, :nt] = _birth_M1 + epsilon   # dummy src → tgt cell j: max within j's type
         if _has_dummy_src and _has_dummy_tgt:
-            M1_aug[ns, nt] = np.max(M1_np) + epsilon
+            M1_aug[ns, nt] = np.max(M1_np) + epsilon          # dummy-to-dummy is free
         M1 = nx.from_numpy(M1_aug)
 
+        # ---- Augment M2: add dummy row/col only where needed ----
         M2_aug = np.zeros((_ns_aug, _nt_aug), dtype=np.float64)
         M2_aug[:ns, :nt] = M2_np
         if _has_dummy_tgt:
-            M2_aug[:ns, nt] = _death_M2 + epsilon
+            M2_aug[:ns, nt] = _death_M2 + epsilon   # src cell i → dummy tgt: max within i's type
         if _has_dummy_src:
-            M2_aug[ns, :nt] = _birth_M2 + epsilon
+            M2_aug[ns, :nt] = _birth_M2 + epsilon   # dummy src → tgt cell j: max within j's type
         if _has_dummy_src and _has_dummy_tgt:
-            M2_aug[ns, nt] = np.max(M2_np) + epsilon
+            M2_aug[ns, nt] = np.max(M2_np) + epsilon          # dummy-to-dummy is free
         M2 = nx.from_numpy(M2_aug)
 
         logFile.write(f"[dummy_cell] Augmented: D_A {tuple(D_A.shape)}, D_B {tuple(D_B.shape)}, "
                       f"M1 {tuple(M1.shape)}, M2 {tuple(M2.shape)}\n")
 
-    if isinstance(nx, ot.backend.TorchBackend) and use_gpu:
+    if isinstance(nx,ot.backend.TorchBackend) and use_gpu:
+        # M = M.cuda()
+
         M1 = M1.cuda()
         M2 = M2.cuda()
-        if _has_partial or (_has_dummy_src or _has_dummy_tgt):
+        if dummy_cell and (_has_dummy_src or _has_dummy_tgt):
             D_A = D_A.cuda()
             D_B = D_B.cuda()
-
-    # ── Marginal distributions ────────────────────────────────────────────
-    ns = sliceA.shape[0]
-    nt = sliceB.shape[0]
-
+    
+    # init distributions
     if a_distribution is None:
-        if _has_partial:
-            # Partial FGW: real weights = m/ns, dummy weight = 1-m
-            a_vals      = np.full(ns + 1, _partial_m / ns, dtype=np.float64)
-            a_vals[-1]  = 1.0 - _partial_m
-            a = nx.from_numpy(a_vals)
-        elif dummy_cell:
+        if dummy_cell:
             if _has_dummy_src:
-                a_vals      = np.full(ns + 1, 1.0 / _budget, dtype=np.float64)
-                a_vals[-1]  = float(_w_dummy_src) / _budget
+                a_vals = np.full(ns + 1, 1.0 / _budget, dtype=np.float64)
+                a_vals[-1] = float(_w_dummy_src) / _budget
                 a = nx.from_numpy(a_vals)
             else:
                 a = nx.ones((ns,), type_as=np.array([1.0], dtype=np.float64)) / _budget
         else:
-            a = nx.ones((sliceA.shape[0],)) / sliceA.shape[0]
+            # uniform distribution, a = array([1/n, 1/n, ...])
+            a = nx.ones((sliceA.shape[0],))/sliceA.shape[0]
     else:
-        if _has_partial or dummy_cell:
-            raise ValueError("Custom a_distribution is not supported with partial_fgw / dummy_cell.")
+        if dummy_cell:
+            raise ValueError("Custom a_distribution is not supported with dummy_cell=True.")
         a = nx.from_numpy(a_distribution)
-
+        
     if b_distribution is None:
-        if _has_partial:
-            # Partial FGW: real weights = m/nt, dummy weight = 1-m
-            b_vals      = np.full(nt + 1, _partial_m / nt, dtype=np.float64)
-            b_vals[-1]  = 1.0 - _partial_m
-            b = nx.from_numpy(b_vals)
-        elif dummy_cell:
+        if dummy_cell:
             if _has_dummy_tgt:
-                b_vals      = np.full(nt + 1, 1.0 / _budget, dtype=np.float64)
-                b_vals[-1]  = float(_w_dummy_tgt) / _budget
+                b_vals = np.full(nt + 1, 1.0 / _budget, dtype=np.float64)
+                b_vals[-1] = float(_w_dummy_tgt) / _budget
                 b = nx.from_numpy(b_vals)
             else:
                 b = nx.ones((nt,), type_as=np.array([1.0], dtype=np.float64)) / _budget
         else:
-            b = nx.ones((sliceB.shape[0],)) / sliceB.shape[0]
+            b = nx.ones((sliceB.shape[0],))/sliceB.shape[0]
     else:
-        if _has_partial or dummy_cell:
-            raise ValueError("Custom b_distribution is not supported with partial_fgw / dummy_cell.")
+        if dummy_cell:
+            raise ValueError("Custom b_distribution is not supported with dummy_cell=True.")
         b = nx.from_numpy(b_distribution)
 
     if isinstance(nx,ot.backend.TorchBackend) and use_gpu:
@@ -864,29 +726,31 @@ def pairwise_align(
     
     # Run OT
     if G_init is not None:
-        if _has_partial or (_has_dummy_src or _has_dummy_tgt):
+        if dummy_cell and (_has_dummy_src or _has_dummy_tgt):
             # Pad user-provided (ns x nt) G_init to augmented dims
-            _gi     = np.array(G_init, dtype=np.float64)
+            _gi = np.array(G_init, dtype=np.float64)
             _gi_aug = np.zeros((_ns_aug, _nt_aug), dtype=np.float64)
             _gi_aug[:ns, :nt] = _gi
-            G_init  = _gi_aug
+            G_init = _gi_aug
         G_init = nx.from_numpy(G_init)
-        if isinstance(nx, ot.backend.TorchBackend):
+        if isinstance(nx,ot.backend.TorchBackend):
             G_init = G_init.float()
             if use_gpu:
                 G_init = G_init.cuda()
 
-    # Initial objective uses original (unaugmented) dims for fair comparison
-    G = np.ones((ns, nt)) / (ns * nt)
+    if dummy_cell:
+        # Use original dims for initial objective logging
+        _ns_log, _nt_log = sliceA.shape[0], sliceB.shape[0]
+        G = np.ones((_ns_log, _nt_log)) / (_ns_log * _nt_log)
+    else:
+        G = np.ones((a.shape[0], b.shape[0])) / (a.shape[0] * b.shape[0])
 
     if neighborhood_dissimilarity == 'jsd':
-        initial_obj_neighbor = np.sum(js_dist_neighborhood * G)
-    elif neighborhood_dissimilarity == 'msd':
-        initial_obj_neighbor = np.sum(msd_neighborhood * G)
+        initial_obj_neighbor = np.sum(js_dist_neighborhood*G)
+    if neighborhood_dissimilarity == 'msd':
+        initial_obj_neighbor = np.sum(msd_neighborhood*G)
     elif neighborhood_dissimilarity == 'cosine':
-        initial_obj_neighbor = np.sum(cosine_dist_neighborhood * G)
-    else:
-        raise ValueError(f"Unsupported neighborhood_dissimilarity: {neighborhood_dissimilarity!r}")
+        initial_obj_neighbor = np.sum(cosine_dist_neighborhood*G)
 
     initial_obj_gene = np.sum(cosine_dist_gene_expr*G)
 
@@ -906,59 +770,37 @@ def pairwise_align(
     
 
     # D_A: pairwise dist matrix of sliceA spots coords
-    # a: initial distribution of sliceA spots
-    _needs_emd = _has_partial or _has_dummy_src or _has_dummy_tgt
-    _fgw_extra = {'numItermaxEmd': 500_000} if _needs_emd else {}
-    pi, logw = fused_gromov_wasserstein_incent(
-        M1, M2, D_A, D_B, a, b,
-        G_init=G_init, loss_fun='square_loss',
-        alpha=alpha, gamma=gamma, log=True,
-        numItermax=numItermax, verbose=verbose,
-        use_gpu=use_gpu, **_fgw_extra
-    )
+    # a: initial distribution(uniform) of sliceA spots
+    _fgw_extra = {'numItermaxEmd': 500_000} if dummy_cell else {}
+    pi, logw = fused_gromov_wasserstein_incent(M1, M2, D_A, D_B, a, b, G_init = G_init, loss_fun='square_loss', alpha= alpha, gamma=gamma, log=True, numItermax=numItermax,verbose=verbose, use_gpu = use_gpu, **_fgw_extra)
     pi = nx.to_numpy(pi)
+    # obj = nx.to_numpy(logw['fgw_dist'])
 
-    # ── Strip dummy row/col and renormalize ───────────────────────────────
-    if _has_partial:
-        # Both a dummy row (ns) and a dummy col (nt) are always present
-        pi_full    = pi.copy()
-        death_mass = float(pi_full[:ns, nt].sum())   # src sent to dummy tgt
-        birth_mass = float(pi_full[ns, :nt].sum())   # tgt received from dummy src
-        pi         = pi_full[:ns, :nt]
-        pi_sum     = float(pi.sum())
-        if pi_sum > 0:
-            pi = pi / pi_sum
-        logFile.write(
-            f"[partial_fgw] death_mass={death_mass:.6f}, birth_mass={birth_mass:.6f}, "
-            f"real_to_real_mass={pi_sum:.6f} (renormalized to 1.0)\n"
-        )
-        print(
-            f"[partial_fgw] death_mass: {death_mass:.6f}, birth_mass: {birth_mass:.6f}, "
-            f"real_to_real_mass: {pi_sum:.6f} (renormalized to 1.0)"
-        )
-
-    elif dummy_cell and (_has_dummy_src or _has_dummy_tgt):
-        ns, nt  = sliceA.shape[0], sliceB.shape[0]
+    # ── Dummy cell: strip dummy row/col, renormalize, report birth/death ────
+    if dummy_cell and (_has_dummy_src or _has_dummy_tgt):
         pi_full = pi.copy()
+
+        # Compute birth / death mass before stripping
         birth_mass = float(pi_full[-1, :nt].sum()) if _has_dummy_src else 0.0
         death_mass = float(pi_full[:ns, -1].sum()) if _has_dummy_tgt else 0.0
+
+        # Strip only the dummy row/col that was actually added
         if _has_dummy_src and _has_dummy_tgt:
             pi = pi_full[:ns, :nt]
         elif _has_dummy_src:
-            pi = pi_full[:ns, :]
+            pi = pi_full[:ns, :]      # strip dummy source row only
         elif _has_dummy_tgt:
-            pi = pi_full[:, :nt]
-        pi_sum = float(pi.sum())
+            pi = pi_full[:, :nt]      # strip dummy target col only
+
+        # Renormalize so pi sums to 1 (fair comparison with balanced baseline)
+        pi_sum = pi.sum()
         if pi_sum > 0:
             pi = pi / pi_sum
-        logFile.write(
-            f"[dummy_cell] death_mass={death_mass:.6f}, birth_mass={birth_mass:.6f}, "
-            f"real_mass_before_norm={pi_sum:.6f}\n"
-        )
-        print(
-            f"[dummy_cell] death_mass: {death_mass:.6f}, birth_mass: {birth_mass:.6f}, "
-            f"real_to_real_mass: {pi_sum:.6f} (renormalized to 1.0)"
-        )
+
+        logFile.write(f"[dummy_cell] death_mass={death_mass:.6f}, birth_mass={birth_mass:.6f}, "
+                      f"real_mass_before_norm={pi_sum:.6f}\n")
+        print(f"[dummy_cell] death_mass: {death_mass:.6f}, birth_mass: {birth_mass:.6f}, "
+              f"real_to_real_mass: {pi_sum:.6f} (renormalized to 1.0)")
 
     if neighborhood_dissimilarity == 'jsd':
         max_indices = np.argmax(pi, axis=1)
@@ -1048,72 +890,40 @@ def neighborhood_distribution(curr_slice, radius):
     return np.array(cells_within_radius)
 
 
-
-def cosine_distance(
-    sliceA,
-    sliceB,
-    sliceA_name,
-    sliceB_name,
-    filePath,
-    use_rep=None,
-    use_gpu=False,
-    nx=ot.backend.NumpyBackend(),
-    overwrite=False,
-):
-    """
-    Compute cosine distance between gene expression matrices of two slices.
-
-    Backend-safe (NumPy / Torch), GPU-safe, and cache-enabled.
-    """
-
-    import os
-    import numpy as np
+def cosine_distance(sliceA, sliceB, sliceA_name, sliceB_name, filePath, use_rep = None, use_gpu = False, nx = ot.backend.NumpyBackend(), beta = 0.8, overwrite = False):
     from sklearn.metrics.pairwise import cosine_distances
+    import os
 
-    # ─────────────────────────────────────────────
-    # Extract expression matrices
-    # ─────────────────────────────────────────────
-    A_X = extract_data_matrix(sliceA, use_rep)
-    B_X = extract_data_matrix(sliceB, use_rep)
+    A_X, B_X = nx.from_numpy(to_dense_array(extract_data_matrix(sliceA,use_rep))), nx.from_numpy(to_dense_array(extract_data_matrix(sliceB,use_rep)))
 
-    A_X = nx.from_numpy(to_dense_array(A_X))
-    B_X = nx.from_numpy(to_dense_array(B_X))
-
-    # Move to GPU if TorchBackend and requested
-    if isinstance(nx, ot.backend.TorchBackend) and use_gpu:
+    if isinstance(nx,ot.backend.TorchBackend) and use_gpu:
         A_X = A_X.cuda()
         B_X = B_X.cuda()
 
-    # Small stability constant
+   
     s_A = A_X + 0.01
     s_B = B_X + 0.01
 
-    # ─────────────────────────────────────────────
-    # File cache
-    # ─────────────────────────────────────────────
-    os.makedirs(filePath, exist_ok=True)
     fileName = f"{filePath}/cosine_dist_gene_expr_{sliceA_name}_{sliceB_name}.npy"
-
+    
     if os.path.exists(fileName) and not overwrite:
-        print("Loading precomputed cosine distance (gene expression)")
-        return np.load(fileName)
+        print("Loading precomputed Cosine distance of gene expression for slice A and slice B")
+        cosine_dist_gene_expr = np.load(fileName)
+    else:
+        print("Calculating cosine dist of gene expression for slice A and slice B")
 
-    print("Computing cosine distance (gene expression)")
+        # calculate cosine distance manually
+        # cosine_dist_gene_expr = 1 - (s_A @ s_B.T) / s_A.norm(dim=1)[:, None] / s_B.norm(dim=1)[None, :]
+        # cosine_dist_gene_expr = cosine_dist_gene_expr.cpu().detach().numpy()
 
-    # ─────────────────────────────────────────────
-    # Convert safely to NumPy (backend aware)
-    # ─────────────────────────────────────────────
-    s_A_np = nx.to_numpy(s_A)
-    s_B_np = nx.to_numpy(s_B)
+        # use sklearn's cosine_distances
+        if torch.cuda.is_available():
+            s_A = s_A.cpu().detach().numpy()
+            s_B = s_B.cpu().detach().numpy()
+        cosine_dist_gene_expr = cosine_distances(s_A, s_B)
 
-    # ─────────────────────────────────────────────
-    # Compute cosine distance
-    # ─────────────────────────────────────────────
-    cosine_dist_gene_expr = cosine_distances(s_A_np, s_B_np)
-
-    # Save
-    np.save(fileName, cosine_dist_gene_expr)
-    print("Saved cosine distance matrix")
+        print("Saving cosine dist of gene expression for slice A and slice B")
+        np.save(fileName, cosine_dist_gene_expr)
 
     return cosine_dist_gene_expr
 
